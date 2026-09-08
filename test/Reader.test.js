@@ -31,8 +31,8 @@ function assertCode(fn, code) {
     'expected a LiteBinaryReaderError with code ' + code);
 }
 
-test('VERSION is the shipped v0.1.2 string', () => {
-  assert.equal(VERSION, '0.1.2');
+test('VERSION is the shipped v0.2.0 string', () => {
+  assert.equal(VERSION, '0.2.0');
 });
 
 test('every getX reads its type bit-exact against a DataView (LE)', () => {
@@ -425,4 +425,41 @@ test('BR-03: a NaN / Infinity / fractional byteOffset throws R_BAD_OFFSET (was s
   assertCode(() => new LiteBinaryReader(new ArrayBuffer(64), { schema, byteOffset: NaN }), 'R_BAD_OFFSET');
   assertCode(() => new LiteBinaryReader(new ArrayBuffer(64), { schema, byteOffset: Infinity }), 'R_BAD_OFFSET');
   assertCode(() => new LiteBinaryReader(new ArrayBuffer(64), { schema, byteOffset: 1.5 }), 'R_BAD_OFFSET');
+});
+
+test('BR-08: a detached ArrayBuffer throws a coded R_BAD_SOURCE (was a raw DataView TypeError)', () => {
+  const schema = [{ name: 'x', type: T_F64, offset: 0 }];
+  const ab = new ArrayBuffer(64);
+  structuredClone(ab, { transfer: [ab] }); // transfers -> detaches ab
+  assertCode(() => new LiteBinaryReader(ab, { schema }), 'R_BAD_SOURCE');
+});
+
+test('BR-08: a view over a detached buffer throws a coded R_BAD_SOURCE', () => {
+  const schema = [{ name: 'x', type: T_F64, offset: 0 }];
+  const buf = new ArrayBuffer(64);
+  const view = new Uint8Array(buf);
+  structuredClone(buf, { transfer: [buf] }); // detaches the view's backing buffer
+  assertCode(() => new LiteBinaryReader(view, { schema }), 'R_BAD_SOURCE');
+});
+
+test('BR-08: a legitimately zero-length ArrayBuffer is NOT detached (constructs, count 0)', () => {
+  const rd = new LiteBinaryReader(new ArrayBuffer(0), { schema: [{ name: 'x', type: T_U8, offset: 0 }] });
+  assert.equal(rd.count, 0);
+});
+
+test('BR-09: a DataView over a detached buffer throws a coded R_BAD_SOURCE (was a raw TypeError from a throwing byteOffset getter)', () => {
+  const schema = [{ name: 'x', type: T_F64, offset: 0 }];
+  const buf = new ArrayBuffer(64);
+  const dv = new DataView(buf);
+  structuredClone(buf, { transfer: [buf] }); // detaches dv's backing buffer -> its getters now THROW
+  assertCode(() => new LiteBinaryReader(dv, { schema }), 'R_BAD_SOURCE');
+});
+
+test('BR-09: a DataView over a LIVE buffer constructs normally (full-span, zero-copy unwrap)', () => {
+  const schema = [{ name: 'x', type: T_F64, offset: 0 }];
+  const buf = new ArrayBuffer(64);
+  new DataView(buf).setFloat64(0, 42.5, true);
+  const rd = new LiteBinaryReader(new DataView(buf), { schema });
+  assert.equal(rd.count, 8);
+  assert.equal(rd.getF64(0, 0), 42.5);
 });

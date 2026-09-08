@@ -195,14 +195,33 @@ export async function settleGc(cycles) {
  * T2 asserts it returns null on every valid input; T9 asserts it returns
  * non-null on hand-fabricated BR-01/BR-02/BR-03 inputs (non-vacuity).
  * -------------------------------------------------------------------------- */
+/**
+ * Local detached-buffer probe. The harness imports NOTHING from Reader.js on the
+ * door-invariant path (by rule), so it re-derives the constructor's BR-08 check
+ * independently. A detached buffer reports byteLength 0 yet is `instanceof
+ * ArrayBuffer`; a legitimately zero-length buffer is NOT detached. Only length 0
+ * is ambiguous.
+ */
+const HAS_DETACHED = typeof Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'detached') === 'object';
+function bufferIsDetached(buffer) {
+  if (buffer.byteLength > 0) return false;
+  if (HAS_DETACHED) return buffer.detached === true;
+  try { new DataView(buffer); return false; } catch (e) { return true; }
+}
+
 export function checkCoherence(source, options) {
   if (!options || typeof options !== 'object') return 'options with a schema are required';
 
   // --- resolve the buffer length exactly as the constructor would -------------
+  // BR-08: a detached ArrayBuffer, or a view over a detached buffer, is a bad
+  // source -- flagged BEFORE any schema check so the door <-> coherence agreement
+  // still holds on a detached input (the constructor throws R_BAD_SOURCE here).
   let byteLength;
   if (source instanceof ArrayBuffer) {
+    if (bufferIsDetached(source)) return 'source ArrayBuffer is detached';
     byteLength = source.byteLength;
   } else if (ArrayBuffer.isView(source)) {
+    if (bufferIsDetached(source.buffer)) return 'source ArrayBuffer is detached';
     byteLength = source.byteLength; // a pooled view is copied to a window of this length
   } else {
     return 'source must be an ArrayBuffer or a typed-array view';

@@ -89,6 +89,27 @@ export async function run() {
   // R_BAD_SOURCE (P10): a plain array is not an ArrayBuffer or view.
   expectCode(() => new LiteBinaryReader([1, 2, 3], { schema: okSchema }),
     'R_BAD_SOURCE', 'P10 plain array source');
+  // R_BAD_SOURCE (BR-08): a DETACHED ArrayBuffer, and a view over a detached
+  // buffer, both reach the coercion block with a dead backing store and must be
+  // refused with a coded R_BAD_SOURCE (not a raw DataView TypeError).
+  const detachedAb = new ArrayBuffer(64);
+  structuredClone(detachedAb, { transfer: [detachedAb] }); // transfers -> detaches detachedAb
+  expectCode(() => new LiteBinaryReader(detachedAb, { schema: okSchema }),
+    'R_BAD_SOURCE', 'BR-08 detached ArrayBuffer');
+  const detachedViewBuf = new ArrayBuffer(64);
+  const detachedView = new Uint8Array(detachedViewBuf);
+  structuredClone(detachedViewBuf, { transfer: [detachedViewBuf] }); // detaches the view's buffer
+  expectCode(() => new LiteBinaryReader(detachedView, { schema: okSchema }),
+    'R_BAD_SOURCE', 'BR-08 view over a detached buffer');
+  // R_BAD_SOURCE (BR-09): a DataView over a detached buffer. A DataView's
+  // byteOffset/byteLength getters THROW when the backing buffer is detached
+  // (TypedArray getters return 0), so the view branch must probe source.buffer
+  // for detachment BEFORE any view getter -- else this threw a raw TypeError.
+  const detachedDvBuf = new ArrayBuffer(64);
+  const detachedDv = new DataView(detachedDvBuf);
+  structuredClone(detachedDvBuf, { transfer: [detachedDvBuf] }); // detaches the DataView's buffer
+  expectCode(() => new LiteBinaryReader(detachedDv, { schema: okSchema }),
+    'R_BAD_SOURCE', 'BR-09 DataView over a detached buffer');
 
   // --- pooled/offset-view COPY isolation (D7/P12) -----------------------------
   // A pooled Uint8Array window whose surrounding bytes are POISON. The reader
@@ -171,14 +192,21 @@ export async function run() {
     'R_BAD_SCHEMA', 'BR-06 fromLBK1Shard fieldless');
 
   // --- 4. the full door matrix (ROADMAP section 4) ----------------------------
-  // source {ArrayBuffer, full-span view, zero-offset PARTIAL view, offset view}
-  //   x count {derived,explicit} x byteOffset {in-range,==len,past,negative,NaN}
-  //   x type {integer,2.5,"1",-1,8} x offset {int,1.5,-1}
-  //   x stride {derived,==maxEnd,<maxEnd}.
+  // source {ArrayBuffer, full-span view, zero-offset PARTIAL view, offset view,
+  //   full-span DataView, detached} x count {derived,explicit} x byteOffset
+  //   {in-range,==len,past,negative,NaN} x type {integer,2.5,"1",-1,8}
+  //   x offset {int,1.5,-1} x stride {derived,==maxEnd,<maxEnd}.
   // Every cell asserts the CONTRACT: the constructor throws a coded R_* IFF
   // checkCoherence flags the same input non-null, and never throws an UNCODED
-  // error. This is 4 x 2 x 5 x 5 x 3 x 3 = 1800 cells and it is the door <->
+  // error. This is 6 x 2 x 5 x 5 x 3 x 3 = 2700 cells and it is the door <->
   // checkCoherence agreement (the two must never disagree on any input).
+  // BR-08: the `detached` source kind is a dead backing store -- every one of its
+  // cells must throw R_BAD_SOURCE and checkCoherence must flag it non-null, so the
+  // agreement law holds even though a detached buffer never reaches schema checks.
+  // BR-09: the `dataview` kind is exercised across the WHOLE matrix -- a DataView
+  // is ArrayBuffer.isView-true and a documented source; the S3 QA hole was that
+  // neither suite ever fed one. Its detached variant is covered by the named case
+  // above and, over the matrix, by the throws-IFF-checkCoherence law.
   // BR-07: the SOURCE dimension is load-bearing -- an ArrayBuffer resolves its
   // length one way and a PARTIAL/offset view another (source.byteLength, post
   // copy-to-window), so crossing only ArrayBuffers left the one input class where
@@ -213,7 +241,7 @@ export async function run() {
     { label: '==maxEnd', set: true, stride: 8 }, // F64 maxEnd at offset 0
     { label: '<maxEnd', set: true, stride: 4 },
   ];
-  // Four SOURCE kinds. Each `make()` returns a FRESH source so no cell can be
+  // Six SOURCE kinds. Each `make()` returns a FRESH source so no cell can be
   // perturbed by a prior construction. A view's checkCoherence/constructor length
   // is source.byteLength; an ArrayBuffer's is its own byteLength.
   //   - ArrayBuffer:      64 bytes, used as-is (zero-copy).
@@ -221,11 +249,20 @@ export async function run() {
   //   - zero-offset PARTIAL view: byteLength 32 over a 64-byte buffer -- the
   //     BR-07 class: copied to its own 32-byte window, NOT unwrapped to 64.
   //   - offset view:      byteOffset 16, byteLength 32 -- copied to a 32 window.
+  //   - dataview:         a full-span DataView over a 64-byte buffer -- also
+  //     ArrayBuffer.isView-true; unlike a TypedArray, its byteOffset/byteLength
+  //     getters THROW on a detached buffer, so the view branch must probe
+  //     source.buffer FIRST (BR-09). Full-span, so it unwraps zero-copy.
+  //   - detached:         a 64-byte buffer transferred away (structuredClone with
+  //     transfer, NOT MessageChannel -- no event-loop handle, cheap x540). A dead
+  //     backing store: every cell must throw R_BAD_SOURCE (BR-08).
   const M_SOURCES = [
     { label: 'ArrayBuffer', make: () => new ArrayBuffer(64) },
     { label: 'full-span view', make: () => new Uint8Array(new ArrayBuffer(64)) },
     { label: 'partial view', make: () => new Uint8Array(new ArrayBuffer(64), 0, 32) },
     { label: 'offset view', make: () => new Uint8Array(new ArrayBuffer(64), 16, 32) },
+    { label: 'dataview', make: () => new DataView(new ArrayBuffer(64)) },
+    { label: 'detached', make: () => { const b = new ArrayBuffer(64); structuredClone(b, { transfer: [b] }); return b; } },
   ];
   for (const sk of M_SOURCES) {
     for (const c of M_COUNTS) {

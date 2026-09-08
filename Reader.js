@@ -36,7 +36,8 @@
  *   - ASCII-only source. Single main file. Zero runtime deps.
  *
  * Read codes (R_*), defined once, prefixed by role (the suite convention):
- *   R_BAD_SOURCE      source is not an ArrayBuffer or a typed-array view
+ *   R_BAD_SOURCE      source is not an ArrayBuffer or a typed-array view, or its
+ *                     backing ArrayBuffer has been detached (transferred away)
  *   R_BAD_SCHEMA      schema is not a non-empty array of field descriptors
  *   R_BAD_TYPE        a field.type is not an integer in 0..7
  *   R_BAD_OFFSET      a field.offset (or byteOffset) is not a coherent non-negative
@@ -50,7 +51,7 @@
  *   R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
  */
 
-export const VERSION = "0.1.2";
+export const VERSION = "0.2.0";
 
 // --- type codes -- byte-for-byte lite-bake's `Types` table (D3) --------------
 export const T_F32 = 0;
@@ -73,6 +74,26 @@ const LANEKIND_TO_TYPE = { 1: T_F64, 2: T_F32, 3: T_U32, 4: T_U8 };
 /** Host byte order, detected once. Used only to read a NATIVE-endian buffer
  *  (e.g. one produced by lite-bake) correctly via `fromBaked`. */
 export const IS_LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
+/** Does this engine expose the `ArrayBuffer.prototype.detached` getter? It is
+ *  Node 21+ / modern browsers only, so on the node>=18 floor this is FALSE and
+ *  the guarded-DataView fallback in isDetached is the real detection path. */
+const HAS_DETACHED = typeof Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "detached") === "object";
+
+/** True iff `buffer`'s backing store has been detached (transferred away). A
+ *  detached buffer reports byteLength 0 yet is still `instanceof ArrayBuffer`,
+ *  so it slips past coercion and blows up later at `new DataView`. A LEGITIMATE
+ *  zero-length buffer (`new ArrayBuffer(0)`) is NOT detached and must return
+ *  false. Any nonzero length is trivially live; only length 0 is ambiguous, so
+ *  the expensive probe stays off the common path.
+ *  - Node 21+ : consult the standard `detached` getter.
+ *  - node>=18 : construct a DataView and treat a throw as detached (a live
+ *    zero-length buffer constructs fine; a detached one throws). */
+function isDetached(buffer) {
+    if (buffer.byteLength > 0) return false;
+    if (HAS_DETACHED) return buffer.detached === true;
+    try { new DataView(buffer); return false; } catch (e) { return true; }
+}
 
 /** Coded, greppable error -- one class, `.code` carries the R_* tag. */
 export class LiteBinaryReaderError extends Error {
@@ -111,6 +132,14 @@ export class LiteBinaryReader {
         if (source instanceof ArrayBuffer) {
             buffer = source;
         } else if (ArrayBuffer.isView(source)) {
+            // BR-09: a DataView's byteOffset/byteLength getters THROW a raw
+            // TypeError when the backing buffer is detached (TypedArray getters
+            // return 0 instead). So probe the UNDERLYING buffer -- a plain
+            // ArrayBuffer whose length/detached getters never throw -- for
+            // detachment BEFORE reading any of the view's own getters. This
+            // catches a detached DataView AND a detached TypedArray at the same
+            // coded door, ahead of any throwing getter or `new DataView`.
+            if (isDetached(source.buffer)) fail("R_BAD_SOURCE", "source view is over a detached ArrayBuffer");
             if (source.byteOffset === 0 && source.byteLength === source.buffer.byteLength) {
                 buffer = source.buffer;              // full-span: zero-copy unwrap
             } else {
@@ -121,6 +150,13 @@ export class LiteBinaryReader {
         } else {
             fail("R_BAD_SOURCE", "source must be an ArrayBuffer or a typed-array view");
         }
+
+        // BR-08: a detached (transferred) buffer is still `instanceof ArrayBuffer`
+        // and a view over one resolves to `buffer = source.buffer` above -- both
+        // reach here with a dead backing store that would throw a raw TypeError at
+        // `new DataView`. Refuse with a coded R_BAD_SOURCE first (a legitimately
+        // zero-length buffer is NOT detached and passes).
+        if (isDetached(buffer)) fail("R_BAD_SOURCE", "source ArrayBuffer is detached");
 
         // --- validate + compact the schema into SoA tables (cold path) --------
         const fields = opts.schema;

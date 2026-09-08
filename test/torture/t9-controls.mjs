@@ -173,4 +173,24 @@ export function run() {
   if (censusOk(pinnedRefs)) die('t9 control 9: censusOk passed a fully-pinned sample (the census is toothless)');
   retainSink.length = 0;
   if (!censusOk([])) die('t9 control 9: censusOk failed an empty sample (should be vacuously ok)');
+
+  // --- Control 10: the detached-source door (BR-08) has teeth AND is non-vacuous.
+  // A LIVE buffer constructs fine (the door does not flag everything); a DETACHED
+  // one is rejected with R_BAD_SOURCE (teeth); and `new ArrayBuffer(0)` -- a
+  // zero-length but NOT detached buffer -- still constructs with count 0, the
+  // discriminator that proves the check keys on detachment, not on byteLength 0. -
+  const liveBuf = new ArrayBuffer(64);
+  const liveReader = new LiteBinaryReader(liveBuf, { schema: [{ name: 'x', type: T_F64, offset: 0 }] });
+  if (liveReader.count !== 8) die('t9 control 10: a live buffer did not construct (count ' + liveReader.count + ' != 8) -- the detached door is vacuous');
+  const deadBuf = new ArrayBuffer(64);
+  structuredClone(deadBuf, { transfer: [deadBuf] }); // transfers -> detaches deadBuf
+  let deadCode = null;
+  try { new LiteBinaryReader(deadBuf, { schema: [{ name: 'x', type: T_F64, offset: 0 }] }); }
+  catch (e) { deadCode = e && e.code; }
+  if (deadCode !== 'R_BAD_SOURCE') die('t9 control 10: a detached buffer was not rejected with R_BAD_SOURCE (got ' + deadCode + ') -- the door has no teeth');
+  const emptyBuf = new ArrayBuffer(0);
+  let emptyReader = null;
+  try { emptyReader = new LiteBinaryReader(emptyBuf, { schema: [{ name: 'x', type: T_U8, offset: 0 }] }); }
+  catch (e) { die('t9 control 10: a zero-length (NOT detached) buffer was wrongly rejected as detached (' + (e && e.code) + ')'); }
+  if (emptyReader.count !== 0) die('t9 control 10: a zero-length buffer did not derive count 0 (' + emptyReader.count + ')');
 }
