@@ -1,0 +1,73 @@
+{
+  "name": "@zakkster/lite-binary-reader",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "version": "0.1.2",
+  "description": "Tiny, zero-dependency, zero-GC reader for raw or foreign binary buffers: point it at an ArrayBuffer + an offsets/type table and read fields with no allocation, any byte offset, explicit endianness.",
+  "type": "module",
+  "main": "./Reader.js",
+  "module": "./Reader.js",
+  "types": "./Reader.d.ts",
+  "exports": {
+    ".": {
+      "types": "./Reader.d.ts",
+      "node": "./Reader.js",
+      "import": "./Reader.js",
+      "default": "./Reader.js"
+    }
+  },
+  "files": [
+    "Reader.js",
+    "Reader.d.ts",
+    "llms.txt",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "torture": "node --expose-gc test/torture.mjs",
+    "torture:controls": "node test/controls.mjs",
+    "verify": "npm test && npm run torture && npm run torture:controls"
+  },
+  "keywords": [
+    "binary",
+    "reader",
+    "arraybuffer",
+    "dataview",
+    "zero-gc",
+    "gc",
+    "garbage-collection",
+    "endianness",
+    "struct",
+    "soa",
+    "wire-format",
+    "parser",
+    "performance",
+    "zero-dependency"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-binary-reader#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-binary-reader.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-binary-reader/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.16.0",
+    "@zakkster/lite-leak": "^1.10.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false
+}

@@ -1,0 +1,112 @@
+/**
+ * t6 -- the zero-alloc gate (STRICT; the read path has no resize frontier).
+ *
+ * The whole promise of this module is that getX / get allocate NOTHING: a read is
+ * one DataView.getX at a computed offset, no object materialized. This tier gates
+ * that at maxMajor:0 / maxPauseMs:4 / maxArrayBuffersGrowth:0 (stabilize:'deep',
+ * via runOpsGate). The last rule is the one that bites: the buffer and its
+ * DataView live OUTSIDE the V8 heap, invisible to a heapUsed gate.
+ *
+ * Two gates, two separate windows (one measurement at a time):
+ *   Gate 1  the canonical hot read loop (all 8 typed getX + get) -- zero-alloc.
+ *   Gate 1b the RETAINED-alloc channel runOpsGate cannot see (async-gc blind
+ *           spot): runAllocsGate forces a collection per batch and gates
+ *           per-call surviving bytes at ALLOC_RULES (1 B/call).
+ *
+ * Plus the structural facts a heap gate cannot check (ROADMAP HOT PATH): across
+ * the measured window buffer.byteLength, _dv identity and _off.length are all
+ * unchanged. There is NO Map on the read path, so there is no pre-fill caveat.
+ *
+ * LBR_TORTURE_BREAK=1 injects a retained allocation into the hot body so the gate
+ * rejects the window; T9 Control 1 exercises the same alloc lane in-process.
+ */
+
+import { LiteBinaryReader } from '../../Reader.js';
+import { runOpsGate, runAllocsGate, BREAK, check, die } from './harness.mjs';
+
+const COUNT = 4096;        // 2^12 rows so the hot body masks its index with & MASK
+const MASK = COUNT - 1;
+const STRIDE = 32;         // 8 fields, aligned, padded to 32
+const OPS = 60000;
+const WARMUP = 2000;
+
+const SCHEMA = [
+  { name: 'f64', type: 1, offset: 0 },
+  { name: 'f32', type: 0, offset: 8 },
+  { name: 'i32', type: 2, offset: 12 },
+  { name: 'u32', type: 5, offset: 16 },
+  { name: 'i16', type: 3, offset: 20 },
+  { name: 'u16', type: 6, offset: 22 },
+  { name: 'i8', type: 4, offset: 24 },
+  { name: 'u8', type: 7, offset: 25 },
+];
+
+/** Retained sink for the BREAK control -- survives GC so arrayBuffers grows. */
+const leak = [];
+
+// Hoisted so the hot body closes over primitives/views, never allocates.
+const sink = new Float64Array(1);
+
+export async function run() {
+  const buf = new ArrayBuffer(STRIDE * COUNT);
+  const dv = new DataView(buf);
+  for (let r = 0; r < COUNT; r++) {
+    const b = r * STRIDE;
+    dv.setFloat64(b + 0, r * 1.5 - 3.25, true);
+    dv.setFloat32(b + 8, (r & 255) + 0.5, true);
+    dv.setInt32(b + 12, r - 2048, true);
+    dv.setUint32(b + 16, (r * 7 + 1) >>> 0, true);
+    dv.setInt16(b + 20, (r & 0xffff) - 32768, true);
+    dv.setUint16(b + 22, (r * 3) & 0xffff, true);
+    dv.setInt8(b + 24, (r & 0xff) - 128);
+    dv.setUint8(b + 25, r & 0xff);
+  }
+  const reader = new LiteBinaryReader(buf, { schema: SCHEMA });
+
+  // The canonical hot body: one read per lane width + one generic get, masked
+  // index, single scratch sink, no allocation.
+  const hot = (i) => {
+    const idx = i & MASK;
+    sink[0] += reader.getF64(idx, 0) + reader.getF32(idx, 1) + reader.getI32(idx, 2) +
+      reader.getU32(idx, 3) + reader.getI16(idx, 4) + reader.getU16(idx, 5) +
+      reader.getI8(idx, 6) + reader.getU8(idx, 7) + reader.get(idx, 0);
+    if (BREAK) leak.push(new Float64Array(64)); // control: retained growth
+  };
+
+  // The structural facts a heap gate cannot see.
+  const bufBytesBefore = reader.buffer.byteLength;
+  const dvBefore = reader._dv;
+  const offLenBefore = reader._off.length;
+
+  // --- Gate 1: the canonical hot read loop ------------------------------------
+  const { report, summary } = runOpsGate(hot, { ops: OPS, warmup: WARMUP });
+
+  check(reader.buffer.byteLength === bufBytesBefore,
+    () => 'T6: buffer.byteLength changed ' + bufBytesBefore + ' -> ' + reader.buffer.byteLength);
+  check(reader._dv === dvBefore, () => 'T6: the DataView (_dv) was reallocated across the hot window');
+  check(reader._off.length === offLenBefore,
+    () => 'T6: _off.length changed ' + offLenBefore + ' -> ' + reader._off.length);
+
+  if (!report.ok) {
+    const g = summary.gc;
+    die('T6 alloc gate rejected -- verdict=' + report.verdict +
+      ' source=' + summary.source +
+      ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3) +
+      (BREAK ? ' (LBR_TORTURE_BREAK control -- expected)' : ''));
+  }
+
+  // In BREAK mode the gate was SUPPOSED to reject; reaching here means the
+  // injected allocations slipped through, which is itself a failure.
+  if (BREAK) die('T6: LBR_TORTURE_BREAK injected allocations but the gate passed');
+
+  // --- Gate 1b: the RETAINED-alloc channel runOpsGate cannot see --------------
+  // Same `hot` closure; its `if (BREAK)` branch is dead in a clean run (BREAK
+  // dies at Gate 1 above), so this measures the pure zero-alloc body.
+  const g1b = runAllocsGate(hot, { iterations: 50000, batches: 8 });
+  if (!g1b.ok) {
+    die('T6 retained-alloc gate rejected -- verdict=' + g1b.report.verdict +
+      ' settled=' + g1b.result.settled +
+      ' bytesPerCall=' + g1b.bytesPerCall +
+      ' violations=' + g1b.report.violations.length);
+  }
+}
