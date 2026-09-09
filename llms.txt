@@ -7,7 +7,7 @@ fields with NO allocation, at ANY byte offset, with EXPLICIT endianness. Reads
 through a DataView, so a field may sit at an odd (unaligned) offset a typed-array
 lane cannot address. Single-file ESM, zero runtime dependencies, node:test only.
 
-## Status: 0.3.0 - S4: API sugar (row cursor, readRow, variable-length bytes)
+## Status: 0.4.0 - S4b: native typed-lane fast path (laneOf)
 
 S0 landed the reader and the sibling constructors. S1 hardened the construction
 door (BR-01..BR-04). S2 closed the view-window and sibling-shape holes
@@ -30,11 +30,11 @@ detached-ArrayBuffer family:
   detached buffer (a TypedArray's return 0), so the view branch probes the
   underlying buffer for detachment before reading any view getter.
 
-S4 (this release, 0.3.0) adds three additive ergonomic read surfaces on top of
-the same zero-GC read path -- the numeric read bodies (getF64..getU8/get) are
-byte-identical to 0.2.0, the R_* union stays exactly 10, the type table exactly 8
-(both gated by test/dts-drift.test.js), and each new surface has its own 0-B/op
-and retained-alloc gate (decisions/0004):
+S4 (0.3.0) added three additive ergonomic read surfaces on top of the same
+zero-GC read path -- the numeric read bodies (getF64..getU8/get) are byte-identical
+to 0.2.0, the R_* union stays exactly 10, the type table exactly 8 (both gated by
+test/dts-drift.test.js), and each new surface has its own 0-B/op and retained-alloc
+gate (decisions/0004):
 
 - Row cursor: `seek(row)` (chainable, returns the reader) plus `f64/f32/i32/u32/
   i16/u16/i8/u8(fieldId)` and `val(fieldId)` read at the seeked row without
@@ -55,6 +55,33 @@ and retained-alloc gate (decisions/0004):
   NO new type code, NO new R_* code -- a variable-length field is an ordinary
   numeric field plus a `lengthField` pointer. The 3-arg `bytes(row,id,len)` is
   unchanged.
+
+S4b (this release, 0.4.0) adds ONE additive read surface -- a native typed-array
+lane offered ALONGSIDE getX for the absolute hot loop over one column. The pinned
+core (getF64..getU8/get/bytes/seek+f64..u8/val/readRow) stays byte-identical to
+0.3.0, the R_* union stays exactly 10, the type table exactly 8 (both gated), no
+new code of either kind is minted, and the lane surface carries its own differential
+and 0-B/op gates (decisions/0005):
+
+- `laneOf(fieldId)` -> a frozen `{ view, elemStride, elemOffset }` for a
+  lane-ELIGIBLE field, or `null`. Called ONCE outside the loop like `field()`; the
+  caller then runs `view[row*elemStride + elemOffset]` -- a raw typed-array read,
+  no DataView call, no branch, zero alloc. An ineligible field returns null and is
+  served by getX. laneOf itself is a pure lookup (0 B/op) returning the SAME
+  precomputed descriptor each call.
+- ELIGIBILITY (computed cold at construction, per field): the reader is host-endian
+  (littleEndian === IS_LITTLE_ENDIAN) AND the field's first byte is naturally
+  aligned ((base + offset) % width === 0) AND the stride keeps every row aligned
+  (stride % width === 0), width = TYPE_BYTES[type]. A width-1 field (U8/I8) is
+  always eligible on a host-endian reader. An unaligned field, an odd stride, an
+  opposite-endian reader, or an out-of-range id -> null (the decline contract).
+- A lane read is BYTE-IDENTICAL to getX on every eligible cell (view index maps to
+  the same byte address as DataView.getX); this is proven by a t5 differential
+  across the alignment x endianness x type matrix, with a t9 stride-mutation control
+  for teeth. laneOf DECLINES (returns null) rather than throwing; it is a strict
+  speed option, never a fidelity risk. NO unaligned "fast" path, NO in-lane
+  endianness swap. At most one typed view per PRESENT eligible type is built cold
+  over the owned buffer; that is the only new construction-time allocation.
 
 ## The gap it fills (decisions/0001)
 
@@ -129,11 +156,11 @@ carries a coded `R_*` tag on `error.code`:
                     bytes() span reads past the buffer
 - R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
 
-## API (0.3.0)
+## API (0.4.0)
 
 Named exports from `@zakkster/lite-binary-reader`:
 
-- VERSION: '0.3.0'
+- VERSION: '0.4.0'
 - IS_LITTLE_ENDIAN: boolean (host byte order, detected once)
 - T_F32=0, T_F64=1, T_I32=2, T_I16=3, T_I8=4, T_U32=5, T_U16=6, T_U8=7
 - LiteBinaryReaderError: Error subclass; `.code` carries the R_* tag
@@ -187,6 +214,19 @@ Row fill (S4; zero-alloc into a caller-owned sink):
   fieldCount throws R_BAD_LENGTH before any write (guards the zero-alloc claim: a
   short Array would auto-grow). The loop bounds on fieldCount, not out.length.
 
+Typed-lane fast path (S4b; zero-alloc; opt-in raw typed-array read for the hot loop):
+
+- laneOf(fieldId) -> a frozen Lane { view, elemStride, elemOffset } for a
+  lane-eligible field, or null for an ineligible one. Called ONCE outside the loop
+  like field(). The caller runs `view[row*elemStride + elemOffset]` -- a raw typed
+  read, no DataView call, no branch. laneOf is a pure lookup: 0 B/op, same
+  descriptor reference each call.
+- Eligible iff (littleEndian === IS_LITTLE_ENDIAN) && ((base+offset) % width === 0)
+  && (stride % width === 0), width = TYPE_BYTES[type]. Width-1 (U8/I8) always
+  eligible on a host-endian reader. Unaligned / odd-stride / opposite-endian /
+  out-of-range -> null (the decline contract). A lane read is byte-identical to
+  getX on every eligible cell; laneOf declines rather than lies. NO new R_*/type code.
+
 Escape hatch (allocates ONE small view wrapper -- not zero-GC, not for the frame
 hot path):
 
@@ -214,8 +254,9 @@ Sibling cooperation (cold constructors):
 ## Zero-GC posture (suite CLAUDE.md)
 
 Zero allocation on the read hot path: getX / get / the cursor reads (seek +
-f64..u8 / val) / readRow into a reused sink / the row address arithmetic allocate
-nothing, each with its own 0-B/op and retained-alloc gate. Every allocation lives
+f64..u8 / val) / readRow into a reused sink / the laneOf lookup and the lane read
+loop / the row address arithmetic allocate nothing, each with its own 0-B/op and
+retained-alloc gate. Every allocation lives
 at the construction door or on the throw path. `bytes()` is the one intentional
 exception (a Uint8Array view wrapper) and is documented as such. The torture gate
 (`node --expose-gc test/torture.mjs`, @zakkster/lite-leak +
@@ -225,7 +266,7 @@ allocation and the gate rejects it (a gate that cannot fail is decorative).
 
 ## Testing
 
-- npm test        -- 60 node:test cases (contract + boundary + drift)
+- npm test        -- 73 node:test cases (contract + boundary + drift)
 - npm run torture -- @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints `ok`
 - npm run torture:controls -- the door/coherence controls
 - npm run verify  -- test + torture + controls, the publish gate

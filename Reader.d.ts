@@ -52,6 +52,20 @@ export declare interface Shard {
   fields: { name: string | number; laneKind: number; offsetInRow: number }[];
 }
 
+export declare interface Lane {
+  view:
+    | Float32Array
+    | Float64Array
+    | Int32Array
+    | Int16Array
+    | Int8Array
+    | Uint32Array
+    | Uint16Array
+    | Uint8Array;
+  elemStride: number;
+  elemOffset: number;
+}
+
 export declare type ReaderErrorCode =
   | "R_BAD_SCHEMA"
   | "R_BAD_TYPE"
@@ -78,6 +92,7 @@ export declare class LiteBinaryReader {
   field(name: string | number): number;
   typeOf(fieldId: number): number;
   offsetOf(fieldId: number): number;
+  laneOf(fieldId: number): Lane | null;
   getF64(row: number, fieldId: number): number;
   getF32(row: number, fieldId: number): number;
   getI32(row: number, fieldId: number): number;

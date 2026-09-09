@@ -31,8 +31,8 @@ function assertCode(fn, code) {
     'expected a LiteBinaryReaderError with code ' + code);
 }
 
-test('VERSION is the shipped v0.3.0 string', () => {
-  assert.equal(VERSION, '0.3.0');
+test('VERSION is the shipped v0.4.0 string', () => {
+  assert.equal(VERSION, '0.4.0');
 });
 
 // --- S4 (v0.3.0): the cursor, readRow, and variable-length surfaces ----------
@@ -840,5 +840,349 @@ test('QA-S4g: seek/getX stay symmetric even on a garbage row (NaN/undefined/null
     try { getXResult = rd.getU32(bad, 0); } catch (e) { getXThrew = e; }
     assert.equal(cursorThrew, getXThrew, 'cursor/getX diverged on throw-ness for row=' + bad);
     if (cursorThrew === null) assert.ok(Object.is(cursorResult, getXResult), 'cursor/getX diverged in value for row=' + bad);
+  }
+});
+
+// =============================================================================
+// S4b (v0.4.0) -- laneOf boundary suite, the native typed-lane fast path.
+//
+// Torture already proves (do NOT duplicate here): T5 Oracle E -- lane reads are
+// byte-identical to getX across the full alignment x endianness x type matrix,
+// decline on opposite-endian and unaligned width>1, width-1 stays eligible; T6 --
+// laneOf is 0 B/op and the lane read loop is 0 B/op + 0 retained (the reference-
+// identity checks below are the OBSERVABLE proxy for "no new descriptor built per
+// call" -- the 0 B/op number itself is torture's job, not re-measured here); T9
+// Control 14 -- elemStride+1 / elemOffset+1 diverge, the descriptor is frozen,
+// out-of-range id -> null, the decline controls are non-vacuous.
+//
+// This suite is the boundary MATRIX around laneOf's one entry point (fieldId):
+// 0, 1, N-1, N, N+1, negative, non-integer, null, undefined, NaN, -0; plus the
+// always-eligible width-1 field, the frozen/same-reference descriptor contract,
+// a BR-07 partial+offset view source composed with a nonzero reader byteOffset,
+// all 8 type codes together, and adversarial cases outside T5/T6/T9's aim: a
+// shared per-type view instance, live buffer aliasing under a mid-loop write, and
+// a re-entrant laneOf call mid-iteration. laneOf has no dispose/release surface,
+// so "duplicate dispose" and "dispose-during-iteration" are mapped to their
+// closest meaningful analogs (repeated idempotent resolution; a reentrant call
+// mid-loop) and called out explicitly where used, never silently reinterpreted.
+// =============================================================================
+
+/** An 8-field, one-per-type schema laid out so EVERY field is naturally aligned
+ *  on a matching-endian reader (stride 32, a multiple of every width). Mirrors
+ *  t5-differential's Oracle E aligned layout exactly. */
+function alignedLaneSchema() {
+  return [
+    { name: 'f64', type: T_F64, offset: 0 },
+    { name: 'f32', type: T_F32, offset: 8 },
+    { name: 'i32', type: T_I32, offset: 12 },
+    { name: 'u32', type: T_U32, offset: 16 },
+    { name: 'i16', type: T_I16, offset: 20 },
+    { name: 'u16', type: T_U16, offset: 22 },
+    { name: 'i8', type: T_I8, offset: 24 },
+    { name: 'u8', type: T_U8, offset: 25 },
+  ];
+}
+
+/** Read one cell through the matching typed getX (not the generic get). */
+function laneTypedRead(rd, type, row, id) {
+  switch (type) {
+    case T_F64: return rd.getF64(row, id);
+    case T_F32: return rd.getF32(row, id);
+    case T_I32: return rd.getI32(row, id);
+    case T_U32: return rd.getU32(row, id);
+    case T_I16: return rd.getI16(row, id);
+    case T_U16: return rd.getU16(row, id);
+    case T_I8: return rd.getI8(row, id);
+    default: return rd.getU8(row, id);
+  }
+}
+
+/** Deterministic xorshift32 filler -- no reliance on Math.random for replay. */
+function fillRandomBytes(buf, seed) {
+  const u8 = new Uint8Array(buf);
+  let x = (seed >>> 0) || 1;
+  for (let i = 0; i < u8.length; i++) {
+    x ^= x << 13; x >>>= 0; x ^= x >>> 17; x >>>= 0; x ^= x << 5; x >>>= 0;
+    u8[i] = x & 0xff;
+  }
+}
+
+test('S4b: laneOf id 0, 1, N-1 resolve to a lane whose reads equal getX at every row', () => {
+  const schema = alignedLaneSchema();
+  const stride = 32, rows = 17; // rows so "row 0" and "row count-1" (16) both exercised
+  const buf = new ArrayBuffer(stride * rows);
+  fillRandomBytes(buf, 12345);
+  const rd = new LiteBinaryReader(buf, { schema, stride, littleEndian: IS_LITTLE_ENDIAN });
+  const n = rd.fieldCount; // 8
+  for (const id of [0, 1, n - 1]) {
+    const L = rd.laneOf(id);
+    assert.notEqual(L, null, 'field ' + id + ' expected lane-eligible');
+    assert.ok('view' in L && 'elemStride' in L && 'elemOffset' in L, 'Lane shape missing a key for id ' + id);
+    const t = schema[id].type;
+    for (const row of [0, 1, rows - 1]) {
+      const laneVal = L.view[row * L.elemStride + L.elemOffset];
+      assert.ok(Object.is(laneVal, laneTypedRead(rd, t, row, id)),
+        'lane != getX at id=' + id + ' row=' + row);
+    }
+  }
+});
+
+test('S4b: laneOf id N, N+1, negative, and non-integer ids all decline to null', () => {
+  const schema = alignedLaneSchema();
+  const rd = new LiteBinaryReader(new ArrayBuffer(32 * 4), { schema, stride: 32, littleEndian: IS_LITTLE_ENDIAN });
+  const n = rd.fieldCount;
+  assert.equal(rd.laneOf(n), null);        // N: exactly one past the last field
+  assert.equal(rd.laneOf(n + 1), null);    // N+1
+  assert.equal(rd.laneOf(-1), null);       // negative
+  assert.equal(rd.laneOf(-1000), null);    // very negative
+  assert.equal(rd.laneOf(1.5), null);      // non-integer, in-range value
+  assert.equal(rd.laneOf(n - 0.5), null);  // non-integer, boundary-adjacent
+});
+
+test('S4b: laneOf(null/undefined/no-arg/NaN) decline; laneOf(-0) aliases field 0 (array-index coercion)', () => {
+  const schema = alignedLaneSchema();
+  const rd = new LiteBinaryReader(new ArrayBuffer(32 * 4), { schema, stride: 32, littleEndian: IS_LITTLE_ENDIAN });
+  assert.equal(rd.laneOf(null), null);
+  assert.equal(rd.laneOf(undefined), null);
+  assert.equal(rd.laneOf(), null); // no argument at all
+  assert.equal(rd.laneOf(NaN), null);
+  // -0: ToPropertyKey stringifies -0 to "0", so a plain array read at -0 resolves
+  // the SAME slot as 0 -- NOT a decline. A planner who assumed every "falsy-
+  // looking" input declines would get this wrong; pin the REAL behaviour.
+  const L0 = rd.laneOf(0);
+  const LNeg0 = rd.laneOf(-0);
+  assert.notEqual(L0, null);
+  assert.equal(LNeg0, L0, 'laneOf(-0) must be the IDENTICAL reference to laneOf(0), not merely equal shape');
+});
+
+test('S4b: a width-1 field (U8/I8) is lane-eligible on a matching-endian reader regardless of offset/stride parity', () => {
+  for (const off of [0, 1, 3, 7]) {
+    for (const stride of [off + 1, off + 3, off + 5]) { // odd, non-power-of-two strides too
+      const schema = [{ name: 'u8', type: T_U8, offset: off }];
+      const rows = 5;
+      const buf = new ArrayBuffer(stride * rows);
+      fillRandomBytes(buf, off * 97 + stride + 1);
+      const rd = new LiteBinaryReader(buf, { schema, stride, littleEndian: IS_LITTLE_ENDIAN });
+      const L = rd.laneOf(0);
+      assert.notEqual(L, null, 'U8 at offset ' + off + ' stride ' + stride + ' must be eligible');
+      for (let row = 0; row < rows; row++) {
+        assert.equal(L.view[row * L.elemStride + L.elemOffset], rd.getU8(row, 0));
+      }
+    }
+  }
+  // Same immunity for I8 at an odd offset on an odd stride.
+  const schemaI8 = [{ name: 'i8', type: T_I8, offset: 3 }];
+  const rd2 = new LiteBinaryReader(new ArrayBuffer(7 * 4), { schema: schemaI8, stride: 7, littleEndian: IS_LITTLE_ENDIAN });
+  const L2 = rd2.laneOf(0);
+  assert.notEqual(L2, null, 'I8 at an odd offset on an odd stride must stay eligible');
+  for (let row = 0; row < 4; row++) assert.equal(L2.view[row * L2.elemStride + L2.elemOffset], rd2.getI8(row, 0));
+});
+
+test('S4b: the Lane descriptor is frozen and laneOf returns the SAME reference across repeated calls (precompute, not per-call build)', () => {
+  const schema = alignedLaneSchema();
+  const rd = new LiteBinaryReader(new ArrayBuffer(32 * 4), { schema, stride: 32, littleEndian: IS_LITTLE_ENDIAN });
+  const L1 = rd.laneOf(0);
+  const L2 = rd.laneOf(0);
+  // A third call -- laneOf has no dispose/release surface (it is a pure lookup
+  // over an immutable descriptor), so the closest meaningful "duplicate dispose"
+  // analog is repeated resolution never rebuilding or mutating shared state; pin
+  // identity across 3+ calls, not just 2.
+  const L3 = rd.laneOf(0);
+  assert.equal(L1, L2);
+  assert.equal(L2, L3);
+  assert.ok(Object.isFrozen(L1), 'the Lane descriptor must be frozen');
+  // This test file is ESM (strict mode): writing to a frozen object's own
+  // property throws a TypeError rather than silently no-op-ing.
+  assert.throws(() => { L1.elemStride = 999; }, TypeError);
+  assert.throws(() => { L1.elemOffset = 999; }, TypeError);
+  assert.throws(() => { L1.view = null; }, TypeError);
+  assert.equal(L1.elemStride, L2.elemStride, 'a rejected mutation attempt must not have leaked through');
+  assert.notEqual(L1.view, null);
+});
+
+test('S4b adversarial: multiple eligible fields of the SAME type share exactly one underlying TypedArray view instance', () => {
+  // The planner's descriptor shape does not itself say whether same-type lanes
+  // share a view or each gets its own -- T3.2 promises "at most ONE view per
+  // PRESENT eligible type"; this is the one falsifiable, directly observable
+  // consequence of that promise that no other case in this file checks.
+  const schema = [
+    { name: 'u32a', type: T_U32, offset: 0 },
+    { name: 'u32b', type: T_U32, offset: 4 },
+    { name: 'u32c', type: T_U32, offset: 8 },
+    { name: 'f64', type: T_F64, offset: 16 }, // a different type -> a different view
+  ];
+  const stride = 24;
+  const rd = new LiteBinaryReader(new ArrayBuffer(stride * 6), { schema, stride, littleEndian: IS_LITTLE_ENDIAN });
+  const La = rd.laneOf(0), Lb = rd.laneOf(1), Lc = rd.laneOf(2), Ld = rd.laneOf(3);
+  assert.notEqual(La, null); assert.notEqual(Lb, null); assert.notEqual(Lc, null); assert.notEqual(Ld, null);
+  assert.equal(La.view, Lb.view, 'two eligible U32 fields must share one Uint32Array view');
+  assert.equal(Lb.view, Lc.view, 'three eligible U32 fields must share the SAME Uint32Array view');
+  assert.notEqual(La.view, Ld.view, 'a different type must NOT share the U32 view');
+  assert.ok(La.view instanceof Uint32Array);
+  assert.ok(Ld.view instanceof Float64Array);
+  // distinct elemOffset per field despite the shared view.
+  assert.notEqual(La.elemOffset, Lb.elemOffset);
+  assert.notEqual(Lb.elemOffset, Lc.elemOffset);
+});
+
+test('S4b: a BR-07 partial/offset view source composed with a nonzero reader byteOffset -- laneOf still equals getX (base+copy composed correctly)', () => {
+  const schema = alignedLaneSchema();
+  const stride = 32, rows = 5, base = 8; // base=8 is a multiple of every field width (8,4,2,1)
+  const winStart = 40, winLen = base + stride * rows;
+  const pool = new Uint8Array(winStart + winLen + 16);
+  pool.fill(0xee); // poison outside the reader's window
+  const windowBytes = new Uint8Array(winLen);
+  fillRandomBytes(windowBytes.buffer, 555);
+  pool.set(windowBytes, winStart);
+  const view = new Uint8Array(pool.buffer, winStart, winLen); // nonzero offset -> COPIED (BR-07)
+  const rd = new LiteBinaryReader(view, { schema, stride, byteOffset: base, littleEndian: IS_LITTLE_ENDIAN });
+  // the resolved buffer is the OWNED copy, not the poisoned pool -- proves the
+  // lane views below are built over the copy, not the original backing store.
+  assert.equal(rd.buffer.byteLength, winLen);
+  assert.notEqual(rd.buffer, pool.buffer);
+  const n = rd.fieldCount;
+  let eligible = 0;
+  for (let f = 0; f < n; f++) {
+    const L = rd.laneOf(f);
+    if (L === null) continue;
+    eligible++;
+    const t = schema[f].type;
+    for (let row = 0; row < rows; row++) {
+      assert.ok(Object.is(L.view[row * L.elemStride + L.elemOffset], laneTypedRead(rd, t, row, f)),
+        'lane != getX over BR-07 window+base at f=' + f + ' row=' + row);
+    }
+  }
+  assert.equal(eligible, n, 'base=8 keeps every field aligned -- a non-vacuous, fully-eligible positive case');
+});
+
+test('S4b: all 8 type codes are lane-eligible together and match getX across every row (compact loop)', () => {
+  const schema = alignedLaneSchema();
+  const stride = 32, rows = 50;
+  const buf = new ArrayBuffer(stride * rows);
+  fillRandomBytes(buf, 424242);
+  const rd = new LiteBinaryReader(buf, { schema, stride, littleEndian: IS_LITTLE_ENDIAN });
+  let eligibleCount = 0;
+  for (let f = 0; f < schema.length; f++) {
+    const L = rd.laneOf(f);
+    assert.notEqual(L, null, 'field ' + f + ' (type ' + schema[f].type + ') expected eligible');
+    eligibleCount++;
+    const t = schema[f].type;
+    for (let row = 0; row < rows; row++) {
+      assert.ok(Object.is(L.view[row * L.elemStride + L.elemOffset], laneTypedRead(rd, t, row, f)),
+        'type ' + t + ' lane != getX at row ' + row);
+    }
+  }
+  assert.equal(eligibleCount, 8, 'all 8 type codes must be represented and eligible in this fixture');
+});
+
+test('S4b: an F32 at an odd offset declines while a U8 on the same reader stays eligible; a stride not a multiple of width declines', () => {
+  // Odd offset: F32 (width 4) at offset 1 -> its first byte (base 0 + 1) is not
+  // a multiple of 4 -> declines. A U8 at offset 0 on the SAME reader stays
+  // eligible (width-1 is immune to offset parity).
+  const schema1 = [
+    { name: 'u8', type: T_U8, offset: 0 },
+    { name: 'f32', type: T_F32, offset: 1 },
+  ];
+  const rd1 = new LiteBinaryReader(new ArrayBuffer(5 * 8), { schema: schema1, stride: 5, littleEndian: IS_LITTLE_ENDIAN });
+  assert.notEqual(rd1.laneOf(0), null, 'U8 at offset 0 must stay eligible');
+  assert.equal(rd1.laneOf(1), null, 'F32 at an odd offset must decline');
+
+  // Stride not a multiple of width: F32 at offset 0 (aligned at row 0) but
+  // stride 6 (not a multiple of 4) misaligns row 1 onward -> declines.
+  const schema2 = [{ name: 'f32', type: T_F32, offset: 0 }];
+  const rd2 = new LiteBinaryReader(new ArrayBuffer(6 * 8), { schema: schema2, stride: 6, littleEndian: IS_LITTLE_ENDIAN });
+  assert.equal(rd2.laneOf(0), null, 'a stride not a multiple of the field width must decline');
+});
+
+test('S4b: an opposite-endian reader has an EMPTY lane universe -- every field declines, none eligible', () => {
+  const schema = alignedLaneSchema();
+  const rd = new LiteBinaryReader(new ArrayBuffer(32 * 4), { schema, stride: 32, littleEndian: !IS_LITTLE_ENDIAN });
+  const n = rd.fieldCount;
+  let anyEligible = false;
+  for (let f = 0; f < n; f++) if (rd.laneOf(f) !== null) anyEligible = true;
+  assert.equal(anyEligible, false, 'an opposite-endian reader must offer NO lane at all (the empty case)');
+  // getX still serves every read correctly despite the empty lane universe.
+  assert.equal(typeof rd.getF64(0, 0), 'number');
+});
+
+test('S4b: a re-entrant laneOf call mid-iteration does not disturb an outer lane-read loop (dispose-during-iteration analog)', () => {
+  // laneOf has no dispose/release surface to reenter into; the nearest
+  // meaningful analog is resolving ANOTHER lane (and re-resolving the SAME one)
+  // mid-loop while an outer loop is mid-iteration over its own already-resolved
+  // lane, and confirming the outer loop's view/elemStride/elemOffset stay intact.
+  const schema = alignedLaneSchema();
+  const stride = 32, rows = 10;
+  const buf = new ArrayBuffer(stride * rows);
+  fillRandomBytes(buf, 9001);
+  const rd = new LiteBinaryReader(buf, { schema, stride, littleEndian: IS_LITTLE_ENDIAN });
+  const outer = rd.laneOf(0); // F64 lane, resolved once, outside the loop
+  const outerView = outer.view, outerStride = outer.elemStride, outerOffset = outer.elemOffset;
+  let reentered = false;
+  let sum = 0;
+  for (let row = 0; row < rows; row++) {
+    if (!reentered && row === 3) {
+      reentered = true;
+      const inner = rd.laneOf(1); // a DIFFERENT field, resolved mid-iteration
+      assert.notEqual(inner, null);
+      assert.equal(outer.view, outerView, 'the reentrant call mutated the outer lane view');
+      assert.equal(outer.elemStride, outerStride, 'the reentrant call mutated the outer elemStride');
+      assert.equal(outer.elemOffset, outerOffset, 'the reentrant call mutated the outer elemOffset');
+      // re-resolving the SAME field mid-iteration returns the SAME reference.
+      assert.equal(rd.laneOf(0), outer);
+    }
+    sum += outerView[row * outerStride + outerOffset];
+  }
+  let expected = 0;
+  for (let row = 0; row < rows; row++) expected += rd.getF64(row, 0);
+  assert.ok(Object.is(sum, expected), 'the outer loop must read identically to getX after the reentrant call');
+});
+
+test('S4b: the lane view aliases the LIVE buffer -- a mid-loop write (either direction) is visible on the very next read (no snapshot/caching)', () => {
+  const schema = [{ name: 'u32', type: T_U32, offset: 0 }];
+  const stride = 4, rows = 4;
+  const buf = new ArrayBuffer(stride * rows);
+  const dv = new DataView(buf);
+  for (let r = 0; r < rows; r++) dv.setUint32(r * stride, r + 1, true);
+  const rd = new LiteBinaryReader(buf, { schema, stride, littleEndian: IS_LITTLE_ENDIAN });
+  const L = rd.laneOf(0);
+  assert.notEqual(L, null);
+  assert.equal(L.view[0 * L.elemStride + L.elemOffset], 1);
+  // re-entrant write: mutate row 0's bytes THROUGH the DataView mid-"loop".
+  dv.setUint32(0, 0xdeadbeef, true);
+  assert.equal(L.view[0 * L.elemStride + L.elemOffset], 0xdeadbeef >>> 0, 'the lane view must see a DataView write immediately');
+  assert.equal(rd.getU32(0, 0), 0xdeadbeef >>> 0); // getX agrees -- same live bytes
+  // and the reverse direction: writing THROUGH the lane view is visible to getX.
+  L.view[2 * L.elemStride + L.elemOffset] = 777;
+  assert.equal(rd.getU32(2, 0), 777, 'getX must see a write made through the lane view immediately');
+});
+
+test('S4b: laneOf coexists with the pinned getX/get/seek+cursor/readRow/bytes surfaces on the same reader', () => {
+  const schema = [
+    { name: 'len', type: T_U32, offset: 0 },
+    { name: 'f64', type: T_F64, offset: 8 },
+    { name: 'blob', type: T_U8, offset: 16, lengthField: 'len' },
+  ];
+  const stride = 24, rows = 3;
+  const buf = new ArrayBuffer(stride * rows);
+  const dv = new DataView(buf);
+  const u8 = new Uint8Array(buf);
+  for (let r = 0; r < rows; r++) {
+    const b = r * stride;
+    dv.setUint32(b + 0, r + 1, true);
+    dv.setFloat64(b + 8, r * 1.25 - 2, true);
+    for (let k = 0; k <= r; k++) u8[b + 16 + k] = (r * 10 + k + 1) & 0xff;
+  }
+  const rd = new LiteBinaryReader(buf, { schema, stride, littleEndian: IS_LITTLE_ENDIAN });
+  const Lf64 = rd.laneOf(1);
+  assert.notEqual(Lf64, null);
+  for (let r = 0; r < rows; r++) {
+    assert.ok(Object.is(Lf64.view[r * Lf64.elemStride + Lf64.elemOffset], rd.getF64(r, 1)));
+    assert.ok(Object.is(rd.get(r, 1), rd.getF64(r, 1)));
+    assert.ok(Object.is(rd.seek(r).f64(1), rd.getF64(r, 1)));
+    const out = new Array(3);
+    rd.readRow(r, out);
+    assert.ok(Object.is(out[1], rd.getF64(r, 1)));
+    const v = rd.bytes(r, 2);
+    assert.equal(v.length, r + 1);
   }
 });

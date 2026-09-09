@@ -70,6 +70,7 @@ One `DataView`, any byte offset, endianness you choose, zero allocation on every
   - [The read hot path](#the-read-hot-path)
   - [The row cursor](#the-row-cursor)
   - [Row fill](#row-fill)
+  - [The typed-lane fast path](#the-typed-lane-fast-path)
   - [The bytes escape hatch](#the-bytes-escape-hatch)
   - [Sibling cooperation](#sibling-cooperation)
   - [Type codes](#type-codes)
@@ -88,7 +89,7 @@ One `DataView`, any byte offset, endianness you choose, zero allocation on every
 
 Reading foreign binary in JavaScript has two problems no small library solves at once:
 
-1. **Unaligned fields and foreign endianness.** A typed-array lane (`new Float32Array(buf, off)`) throws on a misaligned view and only ever reads host byte order. Real wire formats and C structs pack fields at whatever offset is convenient and choose their own endianness. A `DataView` reads any type at any offset with an explicit `littleEndian` flag -- so this reader can address a field at offset 2, and read a big-endian buffer on a little-endian host. `lite-bake`, native-endian by construction, cannot.
+1. **Unaligned fields and foreign endianness.** A typed-array lane (`new Float32Array(buf, off)`) throws on a misaligned view and only ever reads host byte order. Real wire formats and C structs pack fields at whatever offset is convenient and choose their own endianness. A `DataView` reads any type at any offset with an explicit `littleEndian` flag -- so this reader can address a field at offset 2, and read a big-endian buffer on a little-endian host. `lite-bake`, native-endian by construction, cannot. When a field IS naturally aligned and host-endian, the typed-array lane is the faster read -- so this reader offers it too, as an opt-in `laneOf` fast path that declines (returns `null`) on exactly the fields a lane cannot serve.
 
 2. **A hot read loop that does not allocate.** Materializing a `{ id, temp, status }` object per record, per frame, hands the GC a bag of short-lived garbage -- and the pauses land as visible jitter in a preview or a scrub. This reader materializes nothing: a read is one `DataView.getX(base + row*stride + off, le)` returning a number. One reader owns the `DataView` and the compacted schema tables; every read after construction allocates zero.
 
@@ -103,6 +104,7 @@ Existing options: hand-rolled `DataView` offset arithmetic (correct, but you re-
   - **`get(row, fieldId)`** -- the generic read; dispatches on the field's stored type code (one branch). Reach for it when the type is data-driven (a mixed-schema walk, tooling, debug); reach for a typed `getX` in a tight loop.
   - **`seek(row)` + `f64`..`u8`(fieldId) + `val(fieldId)`** -- a row cursor for sequential scans: seek a row once, then read its fields without re-passing the row. The cursor reads are the `getX` bodies with the seeked row substituted -- still zero-allocation.
   - **`readRow(row, out)`** -- fills a caller-owned sink (an `Array` or any `TypedArray`) indexed by field id, no record object materialized -- the SoA-to-AoS bridge.
+  - **`laneOf(fieldId)`** -- an opt-in typed-array lane for the absolute hot loop: for a naturally aligned, host-endian field it hands back a `{ view, elemStride, elemOffset }` you index directly (`view[row*elemStride + elemOffset]`), skipping the `DataView` call; for any other field it returns `null` and you fall back to `getX`.
   - **`bytes(row, fieldId, len)`** and **`bytes(row, fieldId)`** -- a borrowed `Uint8Array` view over raw bytes: the escape hatch for a blob or variable-length field. The two-argument form reads the span length from a sibling `lengthField`. Copy what you keep.
   - **`field` / `typeOf` / `offsetOf`** -- name-to-id resolution and per-field introspection.
 - **`LiteBinaryReader.fromBaked(baked, options?)`** and **`fromLBK1Shard(shard, options?)`** -- two cold constructors that read a sibling's output directly (see [Sibling cooperation](#sibling-cooperation)).
@@ -228,6 +230,32 @@ for (let r = 0; r < reader.count; r++) {
 
 A sink that is `null`, has no numeric `length`, or is shorter than `fieldCount` throws `R_BAD_LENGTH` **before any write** -- the door exists to protect the zero-allocation claim itself, since a short `Array` would auto-grow. The loop bounds on `fieldCount`, not `out.length`, so a longer sink is fine and a hostile `length` getter cannot force a short write or a read past.
 
+### The typed-lane fast path
+
+```ts
+interface Lane { view: TypedArray; elemStride: number; elemOffset: number }
+
+laneOf(fieldId: number): Lane | null
+```
+
+For the absolute hot loop over one column, `laneOf` hands back a native typed-array lane so the read is a raw indexed load -- no `DataView` call, no branch. Resolve it ONCE outside the loop, exactly like `field()`: an **eligible** field returns `{ view, elemStride, elemOffset }`; an **ineligible** one returns `null`, and you fall back to `getX`.
+
+```js
+const price = reader.field('price');
+const L = reader.laneOf(price);
+let total = 0;
+if (L) {
+  const { view, elemStride, elemOffset } = L;   // e.g. a Float64Array over the buffer
+  for (let r = 0; r < reader.count; r++) total += view[r * elemStride + elemOffset];
+} else {
+  for (let r = 0; r < reader.count; r++) total += reader.getF64(r, price);   // lane declined -- getX serves it
+}
+```
+
+A field is lane-**eligible** only when a typed-array lane reads the exact same bytes `getX` would: the reader is host-endian (`littleEndian === IS_LITTLE_ENDIAN`), the field's first byte is naturally aligned (`(base + offset) % width === 0`), and the stride keeps every row aligned (`stride % width === 0`). A width-1 field (`T_U8`/`T_I8`) is always eligible on a host-endian reader; an unaligned field, an odd stride, or an opposite-endian reader **declines** -- `laneOf` returns `null` for that field (and for every field of an opposite-endian reader), never a lane that would read wrong bytes. An out-of-range `fieldId` returns `null` too.
+
+The eligibility test and the views are computed **once, cold, at construction**; `laneOf` itself is a pure lookup that allocates nothing and returns the **same frozen descriptor** on every call. The lane read loop is zero-allocation and zero-retained -- its own torture gate holds it there. `laneOf` is a strict speed option, never a fidelity one: it either hands back a host-order typed read or declines, so a caller can always run the `if (L) ... else getX` shape above and be correct on every source. There is no unaligned "fast" path (that is just `getX`) and no endianness swap inside a lane.
+
 ### The bytes escape hatch
 
 ```ts
@@ -278,7 +306,7 @@ Both validate the argument SHAPE before any dereference, so a null or malformed 
 | `T_U16`  | 6     | `getUint16`   | 2             |
 | `T_U8`   | 7     | `getUint8`    | 1             |
 
-Byte-for-byte `@zakkster/lite-bake`'s `Types` table, so a `lite-bake` schema drops into this reader unchanged. `IS_LITTLE_ENDIAN` (the host byte order, detected once) and `VERSION` (`'0.3.0'`) are also exported.
+Byte-for-byte `@zakkster/lite-bake`'s `Types` table, so a `lite-bake` schema drops into this reader unchanged. `IS_LITTLE_ENDIAN` (the host byte order, detected once) and `VERSION` (`'0.4.0'`) are also exported.
 
 ### Error codes
 
@@ -342,9 +370,11 @@ One `LiteBinaryReader` does all its allocation in the constructor: it compacts t
 | `get` (generic)    | **0** |
 | `seek` + `f64`..`u8` / `val` (cursor) | **0** |
 | `readRow(row, out)` into a reused sink | **0** |
+| `laneOf(fieldId)` call | **0** (a lookup returning a precomputed frozen descriptor) |
+| lane read loop (`view[row*elemStride+elemOffset]`) | **0** |
 | `field` / `typeOf` / `offsetOf` | **0** |
 | `bytes(row, field[, len])` | one `Uint8Array` view wrapper (documented; not for the frame hot path) |
-| constructor        | once, per `(source, layout)` -- SoA tables + `DataView`; a non-full-span view also copies to an owned window |
+| constructor        | once, per `(source, layout)` -- SoA tables + `DataView`; a non-full-span view also copies to an owned window; a lane view per present eligible type |
 
 Each new hot surface carries its own zero-alloc and retained-alloc gate: the cursor reads and `readRow` are held to **0 B/op** and **0 retained bytes** the same way the typed getters are.
 
@@ -363,6 +393,7 @@ The one cold branch is the throw path: a coded error is built (and its message c
 - **The cursor is the only mutable state, and only `seek` moves it.** The row cursor makes sequential scans ergonomic without giving up the zero-allocation, unchecked-read contract: `seek` sets one field and returns `this`, the cursor reads inline the same address arithmetic as `getX`, and the stateless row-passing API is untouched and remains the recommended form for random access.
 - **`readRow`'s door protects the zero-alloc claim, not the caller.** The one per-call check `readRow` makes -- that the sink has a numeric `length` at least `fieldCount` -- exists because a short `Array` would silently auto-grow and allocate. It is justified where a per-read bounds check on `getX` is not, because it guards the property the method advertises.
 - **Variable-length adds a pointer, not a code.** A variable-length field is an ordinary numeric field plus a `lengthField` naming the sibling that carries its run length. The length is resolved cold at construction into a per-field table; every failure reuses an existing coded door (`R_UNKNOWN_FIELD`, `R_BAD_LENGTH`, `R_BUFFER_TOO_SMALL`). The `R_*` union stays at exactly ten and the type table at exactly eight -- both gated by the drift test.
+- **The typed-lane fast path is opt-in, and declines rather than lies.** `laneOf` is a second read path (a raw typed-array lane) offered ALONGSIDE `getX`, never woven into it -- no per-read eligibility branch taxes the pinned getters. Eligibility (host-endian, naturally aligned, stride a multiple of the width) is computed cold, and an ineligible field returns `null` instead of a lane that would read wrong bytes, so it is a strict speed option and never a fidelity risk. A differential gate proves every eligible lane read is byte-identical to `getX` across the alignment-by-endianness-by-type matrix, and a controls run mutates a lane's stride to prove that gate has teeth.
 - **The sibling type table is shared, not re-declared.** `T_F32`..`T_U8` are byte-for-byte `lite-bake`'s table, so a `lite-bake` schema needs no translation. LBK1's colliding `lane_kind` table is translated explicitly in `fromLBK1Shard`, so a single ambiguous integer never crosses the boundary silently.
 - **The shipped `.d.ts` is gated against drift.** `Reader.d.ts` is hand-written, but `test/dts-drift.test.js` reads the text of the source, the types, and `package.json` and fails if the `R_*` code union, the export set, or the version drift apart -- with mutation controls proving the gate has teeth.
 
@@ -370,16 +401,16 @@ The one cold branch is the throw path: a coded error is built (and its message c
 
 ## Testing
 
-**60 deterministic tests, all pass**, plus a torture gate that proves leak-freedom and a controls run that proves the door.
+**73 deterministic tests, all pass**, plus a torture gate that proves leak-freedom and a controls run that proves the door.
 
 ```bash
-npm test                 # 60 node:test cases (contract + boundary + drift guard)
+npm test                 # 73 node:test cases (contract + boundary + drift guard)
 npm run torture          # @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints "ok"
 npm run torture:controls # the door + coherence controls (every gate can fail)
 npm run verify           # test + torture + controls, the publish gate
 ```
 
-The suites cover: read fidelity across every type code and both endiannesses; the full fail-closed construction door (every `R_*` path, including detached-buffer BR-08/BR-09, the unaligned-offset read, the derived-vs-explicit stride and count, and the partial-view copy BR-07); the `bytes()` escape hatch and its bounds; the sibling constructors against malformed input; the cursor, `readRow`, and variable-length surfaces (cursor-vs-`getX` parity, the `readRow` door and its reentrancy, and variable-length spans at nonzero-base and partial-view sources); and the `.d.ts` drift guard (code-union, export, and version parity, with mutation controls). The torture harness runs read-fidelity, degenerate-layout, an adversarial source-x-count-x-offset door matrix asserting throws-iff-incoherent across every source kind (including detached and `DataView`), a cursor-vs-`getX` differential, per-surface zero-alloc and retained-alloc gates, and a soak witness. `LBR_TORTURE_BREAK=1` injects a retained allocation to prove the gate can fail; no gate output is a FAIL.
+The suites cover: read fidelity across every type code and both endiannesses; the full fail-closed construction door (every `R_*` path, including detached-buffer BR-08/BR-09, the unaligned-offset read, the derived-vs-explicit stride and count, and the partial-view copy BR-07); the `bytes()` escape hatch and its bounds; the sibling constructors against malformed input; the cursor, `readRow`, and variable-length surfaces (cursor-vs-`getX` parity, the `readRow` door and its reentrancy, and variable-length spans at nonzero-base and partial-view sources); the typed-lane fast path (`laneOf` eligibility and its decline contract on unaligned, odd-stride, opposite-endian, and out-of-range fields, plus lane-vs-`getX` parity including a BR-07 partial-window source); and the `.d.ts` drift guard (code-union, export, and version parity, with mutation controls). The torture harness runs read-fidelity, degenerate-layout, an adversarial source-x-count-x-offset door matrix asserting throws-iff-incoherent across every source kind (including detached and `DataView`), a cursor-vs-`getX` differential, a lane-vs-`getX` differential across the alignment-x-endianness-x-type matrix (with a stride-mutation control for teeth), per-surface zero-alloc and retained-alloc gates, and a soak witness. `LBR_TORTURE_BREAK=1` injects a retained allocation to prove the gate can fail; no gate output is a FAIL.
 
 ---
 

@@ -261,4 +261,56 @@ export function run() {
   let c13Code = null;
   try { c13.bytes(0, 1); } catch (e) { c13Code = e && e.code; }
   if (c13Code !== 'R_BUFFER_TOO_SMALL') die('t9 control 13: a length past the buffer did not throw R_BUFFER_TOO_SMALL (got ' + c13Code + ')');
+
+  // --- Control 14: the typed-lane fast path (S4b) has teeth AND the decline
+  // contract is non-vacuous. On a lane-eligible field the lane read equals
+  // getX on every row (non-vacuity); a lane with elemStride mutated by 1, or
+  // elemOffset mutated by 1, diverges from getX (teeth); the descriptor is frozen
+  // (the freeze-once ruling); and an opposite-endian reader AND a deliberately
+  // unaligned width-2 field both DECLINE (the decline contract, with a genuinely
+  // eligible field proving the positive case is real). ------------------------
+  const c14Schema = [
+    { name: 'f64', type: T_F64, offset: 0 },
+    { name: 'u16', type: 6, offset: 8 }, // T_U16
+  ];
+  const c14Stride = 16; // a multiple of 8 and 2 -> both fields aligned across rows
+  const c14Rows = 32;
+  const c14Buf = new ArrayBuffer(c14Stride * c14Rows);
+  const c14Dv = new DataView(c14Buf);
+  for (let i = 0; i < c14Rows; i++) {
+    c14Dv.setFloat64(i * c14Stride, i * 2.5 - 4, IS_LITTLE_ENDIAN); // all distinct
+    c14Dv.setUint16(i * c14Stride + 8, (i * 37 + 11) & 0xffff, IS_LITTLE_ENDIAN);
+  }
+  const c14 = new LiteBinaryReader(c14Buf, { schema: c14Schema, stride: c14Stride, littleEndian: IS_LITTLE_ENDIAN });
+  const c14L = c14.laneOf(0);
+  if (c14L === null) die('t9 control 14: an aligned F64 field on a matching-endian reader declined a lane (eligibility broken, or the decline test is vacuous)');
+  if (!Object.isFrozen(c14L)) die('t9 control 14: the lane descriptor is not frozen (the freeze-once ruling is not enforced)');
+  // non-vacuity: the CORRECT lane matches getF64 on every row.
+  for (let i = 0; i < c14Rows; i++) {
+    if (!Object.is(c14L.view[i * c14L.elemStride + c14L.elemOffset], c14.getF64(i, 0))) {
+      die('t9 control 14: the correct lane diverged from getF64 at row ' + i + ' (vacuous/broken)');
+    }
+  }
+  // teeth: elemStride mutated by 1 -> the differential diverges.
+  const badStride = { view: c14L.view, elemStride: c14L.elemStride + 1, elemOffset: c14L.elemOffset };
+  let strideDiverges = false;
+  for (let i = 0; i < c14Rows; i++) {
+    if (!Object.is(badStride.view[i * badStride.elemStride + badStride.elemOffset], c14.getF64(i, 0))) { strideDiverges = true; break; }
+  }
+  if (!strideDiverges) die('t9 control 14: a lane with elemStride+1 did not diverge from getF64 (no teeth)');
+  // teeth: elemOffset mutated by 1 -> the differential diverges.
+  const badOffset = { view: c14L.view, elemStride: c14L.elemStride, elemOffset: c14L.elemOffset + 1 };
+  let offsetDiverges = false;
+  for (let i = 0; i < c14Rows; i++) {
+    if (!Object.is(badOffset.view[i * badOffset.elemStride + badOffset.elemOffset], c14.getF64(i, 0))) { offsetDiverges = true; break; }
+  }
+  if (!offsetDiverges) die('t9 control 14: a lane with elemOffset+1 did not diverge from getF64 (no teeth)');
+  // decline contract, non-vacuous: an opposite-endian reader declines the SAME field.
+  const c14Opp = new LiteBinaryReader(c14Buf, { schema: c14Schema, littleEndian: !IS_LITTLE_ENDIAN });
+  if (c14Opp.laneOf(0) !== null) die('t9 control 14: an opposite-endian reader offered a lane (decline contract broken)');
+  // decline contract, non-vacuous: a deliberately unaligned width-2 field declines.
+  const c14Unaligned = new LiteBinaryReader(c14Buf, { schema: [{ name: 'u16', type: 6, offset: 1 }], stride: c14Stride, littleEndian: IS_LITTLE_ENDIAN });
+  if (c14Unaligned.laneOf(0) !== null) die('t9 control 14: an unaligned (offset 1) width-2 field was offered a lane (decline contract broken)');
+  // out-of-range id declines (bounds-safe null, no throw, no new R_* code).
+  if (c14.laneOf(99) !== null) die('t9 control 14: an out-of-range field id did not yield null');
 }

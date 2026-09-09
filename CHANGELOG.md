@@ -2,6 +2,41 @@
 
 All notable changes to `@zakkster/lite-binary-reader`.
 
+## 0.4.0
+
+### Added
+- `laneOf(fieldId)`: an opt-in native typed-array lane offered alongside `getX` for
+  the hot loop over one column. A lane-eligible field returns a precomputed, frozen
+  `{ view, elemStride, elemOffset }` read as `view[row*elemStride + elemOffset]` (no
+  `DataView` call, no branch); an ineligible field, or an out-of-range id, returns
+  `null` and is served by `getX`. Resolve it once outside the loop, like `field()`;
+  the call is a lookup that allocates nothing and returns the same descriptor each time.
+- Eligibility is computed cold at construction: a field is lane-eligible iff the
+  reader is host-endian (`littleEndian === IS_LITTLE_ENDIAN`), the field's first byte
+  is aligned (`(byteOffset + field.offset) % width === 0`), and the stride keeps every
+  row aligned (`stride % width === 0`). A width-1 field (`T_U8`/`T_I8`) is always
+  eligible on a host-endian reader. There is no unaligned lane and no in-lane
+  endianness swap: `laneOf` hands back a host-order typed read or declines.
+- At most one typed view per present eligible type is built cold over the owned
+  buffer; this is the only new construction-time allocation.
+- `Reader.d.ts`: a `Lane` interface (the eight TypedArray view types plus `elemStride`
+  and `elemOffset`) and `laneOf(fieldId): Lane | null` on the class.
+
+### Changed
+- Test count 60 -> 73 (the `laneOf` boundary suite: eligibility across all 8 types,
+  the decline contract on unaligned/odd-stride/opposite-endian/out-of-range fields,
+  frozen-descriptor identity, and lane-vs-`getX` parity including a BR-07 partial-window
+  source).
+- Torture: a t5 lane-vs-`getX` differential across the alignment x endianness x type
+  matrix, a t6 zero-alloc + retained gate for the `laneOf` call and the lane read loop,
+  and a t9 control that mutates a lane's `elemStride`/`elemOffset` to prove the
+  differential has teeth (plus non-vacuous decline checks).
+- The drift gate's class-member floor raised 31 -> 32 for `laneOf`. The `R_*` union
+  stays exactly 10 and the type-code table exactly 8 (no new code of either kind).
+- The v0.3.0 numeric read bodies (`getF64`..`getU8`/`get`/`bytes`/`seek` + `f64`..`u8`/
+  `val`/`readRow`) are byte-identical: `laneOf` is a second read path added beside them,
+  with no per-read eligibility branch in any pinned getter.
+
 ## 0.3.0
 
 ### Added

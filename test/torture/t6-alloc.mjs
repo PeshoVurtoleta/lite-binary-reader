@@ -21,7 +21,7 @@
  * rejects the window; T9 Control 1 exercises the same alloc lane in-process.
  */
 
-import { LiteBinaryReader } from '../../Reader.js';
+import { LiteBinaryReader, IS_LITTLE_ENDIAN } from '../../Reader.js';
 import { runOpsGate, runAllocsGate, BREAK, check, die } from './harness.mjs';
 
 const COUNT = 4096;        // 2^12 rows so the hot body masks its index with & MASK
@@ -155,5 +155,49 @@ export async function run() {
   if (!g3a.ok) {
     die('T6 Gate 3 (readRow) retained-alloc gate rejected -- verdict=' + g3a.report.verdict +
       ' settled=' + g3a.result.settled + ' bytesPerCall=' + g3a.bytesPerCall);
+  }
+
+  // --- Gate 4: the typed-lane fast path (S4b) ----------------------------------
+  // laneOf(id) is a lookup (0 B/op); the lane read loop view[row*eS+eO] is
+  // 0 B/op + 0 retained. Each gets its OWN ops window AND retained-alloc window,
+  // strictly sequential. The lane reader pins littleEndian to IS_LITTLE_ENDIAN so
+  // every field is lane-eligible regardless of host byte order.
+  const laneReader = new LiteBinaryReader(buf, { schema: SCHEMA, stride: STRIDE, littleEndian: IS_LITTLE_ENDIAN });
+  const L0 = laneReader.laneOf(0); // F64 lane, resolved once outside the loop
+  check(L0 !== null, () => 'T6 Gate 4: the F64 field is not lane-eligible -- cannot gate the lane loop');
+  const laneBufBytesBefore = laneReader.buffer.byteLength;
+  const laneDvBefore = laneReader._dv;
+  const laneView = L0.view, laneES = L0.elemStride, laneEO = L0.elemOffset;
+
+  // 4a: the laneOf CALL is 0 B/op -- a pure lookup returning a frozen reference.
+  // Reading a numeric field off the returned descriptor forces the call.
+  const laneOfHot = (i) => { sink[0] += laneReader.laneOf(i & 7).elemOffset; };
+  const g4 = runOpsGate(laneOfHot, { ops: OPS, warmup: WARMUP });
+  if (!g4.report.ok) {
+    const g = g4.summary.gc;
+    die('T6 Gate 4a (laneOf call) ops gate rejected -- verdict=' + g4.report.verdict +
+      ' source=' + g4.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+  }
+  const g4a = runAllocsGate(laneOfHot, { iterations: 50000, batches: 8 });
+  if (!g4a.ok) {
+    die('T6 Gate 4a (laneOf call) retained-alloc gate rejected -- verdict=' + g4a.report.verdict +
+      ' settled=' + g4a.result.settled + ' bytesPerCall=' + g4a.bytesPerCall);
+  }
+
+  // 4b: the lane READ loop view[row*elemStride+elemOffset] is 0 B/op + 0 retained.
+  const laneReadHot = (i) => { sink[0] += laneView[(i & MASK) * laneES + laneEO]; };
+  const g4b = runOpsGate(laneReadHot, { ops: OPS, warmup: WARMUP });
+  check(laneReader.buffer.byteLength === laneBufBytesBefore,
+    () => 'T6 Gate 4: buffer.byteLength changed ' + laneBufBytesBefore + ' -> ' + laneReader.buffer.byteLength);
+  check(laneReader._dv === laneDvBefore, () => 'T6 Gate 4: the DataView (_dv) was reallocated across the lane window');
+  if (!g4b.report.ok) {
+    const g = g4b.summary.gc;
+    die('T6 Gate 4b (lane read) ops gate rejected -- verdict=' + g4b.report.verdict +
+      ' source=' + g4b.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+  }
+  const g4c = runAllocsGate(laneReadHot, { iterations: 50000, batches: 8 });
+  if (!g4c.ok) {
+    die('T6 Gate 4b (lane read) retained-alloc gate rejected -- verdict=' + g4c.report.verdict +
+      ' settled=' + g4c.result.settled + ' bytesPerCall=' + g4c.bytesPerCall);
   }
 }

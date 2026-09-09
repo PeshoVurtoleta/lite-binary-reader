@@ -67,7 +67,7 @@
  *   R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
  */
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
 
 // --- type codes -- byte-for-byte lite-bake's `Types` table (D3) --------------
 export const T_F32 = 0;
@@ -81,6 +81,10 @@ export const T_U8 = 7;
 const TYPE_COUNT = 8;
 /** Width in bytes per type code, indexed by the code itself. */
 const TYPE_BYTES = [4, 8, 4, 2, 1, 4, 2, 1];
+/** TypedArray constructor per type code, indexed by the code itself. Used ONLY
+ *  by the cold typed-lane pass (laneOf) to build at most one host-order view per
+ *  present eligible type; never touched on any read hot path. */
+const TYPE_CTOR = [Float32Array, Float64Array, Int32Array, Int16Array, Int8Array, Uint32Array, Uint16Array, Uint8Array];
 
 /** LBK1 `lane_kind` -> our type code (D3). LBK1: 1=F64, 2=F32, 3=U32, 4=U8.
  *  NOTE: an LBK1 U32 cell is a STRING-TABLE INDEX; read raw it is that index
@@ -260,6 +264,49 @@ export class LiteBinaryReader {
         this._le = opts.littleEndian === undefined ? true : !!opts.littleEndian;
         this._cursor = 0;    // D4 row cursor: moved only by seek(); a Smi by contract
         this._lenOf = lenOf; // per-field lengthField id, or -1 (variable-length wiring)
+
+        // --- typed-lane fast path (T3, COLD): a per-field lane descriptor for --
+        // every lane-ELIGIBLE field, precomputed once here so laneOf(id) is a
+        // pure lookup (zero work, zero alloc on the call -- all allocation at the
+        // door). A field is eligible iff the reader reads HOST byte order AND both
+        // the field's first byte and the stride are naturally aligned to the type
+        // width: `_le === IS_LITTLE_ENDIAN && (_base + off) % width === 0 &&
+        // _stride % width === 0` -- so EVERY row's cell (not just row 0) stays
+        // aligned for a raw typed-array read. At most ONE view per PRESENT
+        // eligible type is built over `buffer` and shared by all its fields.
+        // Each descriptor is Object.freeze'd ONCE here, never per call. An
+        // ineligible field (wrong endianness, unaligned field, unaligned stride)
+        // gets `null` and is served by getX exactly as before: eligibility is an
+        // OPTIMIZATION probe, never a gate on reads. NO new R_* code -- declining
+        // is a normal answer, not an error.
+        const lanes = new Array(n).fill(null);
+        if (this._le === IS_LITTLE_ENDIAN) {
+            const views = [null, null, null, null, null, null, null, null];
+            for (let i = 0; i < n; i++) {
+                const t = this._type[i];
+                const width = TYPE_BYTES[t];
+                const first = this._base + this._off[i];
+                if (first % width !== 0 || this._stride % width !== 0) continue;
+                let view = views[t];
+                if (view === null) {
+                    // Construct over the buffer from byte 0 with an EXPLICIT floored
+                    // element count: `new TYPE_CTOR(buffer)` alone throws unless the
+                    // WHOLE byteLength divides the element width, but a field can be
+                    // cell-aligned on a buffer whose tail is a partial element. The
+                    // door guarantees base+count*stride <= byteLength, and off+width
+                    // <= stride, so every eligible cell's last byte is < the floored
+                    // length -- no row is ever out of view.
+                    view = new TYPE_CTOR[t](buffer, 0, Math.floor(buffer.byteLength / width));
+                    views[t] = view;
+                }
+                lanes[i] = Object.freeze({
+                    view: view,
+                    elemStride: this._stride / width,
+                    elemOffset: first / width,
+                });
+            }
+        }
+        this._lanes = lanes; // per-field frozen Lane { view, elemStride, elemOffset } or null
     }
 
     // --- introspection (cold) -------------------------------------------------
@@ -281,6 +328,21 @@ export class LiteBinaryReader {
     typeOf(fieldId) { return this._type[fieldId]; }
     /** Byte offset (within a record) of a field id. */
     offsetOf(fieldId) { return this._off[fieldId]; }
+
+    /**
+     * The native typed-lane fast path (T3). For a lane-ELIGIBLE field returns its
+     * precomputed frozen `{ view, elemStride, elemOffset }` (a `Lane`); for an
+     * ineligible field -- wrong endianness, or an unaligned field/stride -- OR an
+     * out-of-range id returns `null`. Resolve ONCE outside the loop like field(),
+     * then run the tightest loop yourself:
+     *   `const L = r.laneOf(id);`
+     *   `if (L) { const {view,elemStride,elemOffset}=L;`
+     *   `         for (row=0;row<n;row++) sum += view[row*elemStride+elemOffset]; }`
+     *   `else   { for (row=0;row<n;row++) sum += r.getF32(row, id); }  // fall back`
+     * The call allocates NOTHING -- the descriptor was built cold at construction;
+     * this is a bounds-safe array lookup returning a reference (or null).
+     */
+    laneOf(fieldId) { return this._lanes[fieldId] || null; }
 
     // --- the read hot path (zero-alloc) ---------------------------------------
     // Contract (like lite-bake's lanes): `row` in [0,count), `fieldId` a valid

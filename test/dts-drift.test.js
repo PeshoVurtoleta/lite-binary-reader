@@ -151,7 +151,7 @@ test('(b) export parity: value exports agree + class members present in both', (
   // clean inventory and must not declare surface the source lacks.)
   const jsMembers = classMembers(JS, 'LiteBinaryReader');
   const dtsMembers = classMembers(DTS, 'LiteBinaryReader');
-  assert.ok(dtsMembers.size >= 31, 'expected the d.ts to declare the full member surface, saw ' + dtsMembers.size);
+  assert.ok(dtsMembers.size >= 32, 'expected the d.ts to declare the full member surface, saw ' + dtsMembers.size);
   const memberMissing = [];
   for (const nm of dtsMembers) if (!jsMembers.has(nm)) memberMissing.push('Reader.d.ts declares member ' + nm + ' absent from Reader.js');
   assert.deepEqual(memberMissing, [], memberMissing.join('; '));
