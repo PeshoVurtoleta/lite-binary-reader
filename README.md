@@ -12,6 +12,8 @@
 ![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
 
+> Reads at a hand-written `DataView` loop's speed -- `laneOf` beats it -- and allocates **zero bytes per read**. On the same records it decodes ~8.6x faster than `binary-parser` with **0 B/op** against its per-row objects, from one 9.5 KB (gzip) file with zero dependencies. [See the numbers](#performance).
+
 ## The foreign-bytes reader the ecosystem was missing
 
 `lite-binary-reader` is the raw-input end of the `@zakkster` binary pipeline. `lite-bake` bakes an in-memory column store; `lite-bake-stream` frames a self-describing LBK1 container. Both WRITE binary the suite already understands. Nothing in the suite READS bytes it did not write: a wire protocol off a socket, an mmap'd C struct, WASM linear memory, an SoA column dump, or a record whose fields sit at odd byte offsets. This package is that piece -- a `DataView`-backed reader over a layout you describe, with byte order you choose.
@@ -77,6 +79,7 @@ One `DataView`, any byte offset, endianness you choose, zero allocation on every
   - [Error codes](#error-codes)
 - [Composability with the ecosystem](#composability-with-the-ecosystem)
 - [Zero-GC design notes](#zero-gc-design-notes)
+- [Performance](#performance)
 - [Design decisions worth knowing](#design-decisions-worth-knowing)
 - [Testing](#testing)
 - [What this is not](#what-this-is-not)
@@ -388,6 +391,73 @@ The one cold branch is the throw path: a coded error is built (and its message c
 
 ---
 
+## Performance
+
+Numbers exist to prove the four reasons this package exists: it is **fast**, it is **zero-GC**, it is **tiny**, and it makes a compact wire payload **cheap to consume**. Reproduce them:
+
+```bash
+npm run bench            # node --expose-gc bench/bench.mjs
+```
+
+The harness (`bench/bench.mjs`, repo-only) warms up, brackets each timed loop with `gc()` and `process.hrtime.bigint()`, and reports **both** ns/row and transient/retained bytes per operation. Every contender must decode the **identical** values -- checked cell-for-cell against a `DataView` oracle -- before its timings are trusted; a number measured against wrong or unequal work is not a comparison. Wall-clock figures are **advisory** (they move machine to machine); the **bytes/op** columns are deterministic and are the load-bearing headline. Figures below are representative of one run on Node 26 (LE host, 20,000 records/pass) -- run the command for your own.
+
+### Fast + zero-GC: the read surfaces vs a hand-written `DataView` loop
+
+The plain-`DataView` loop is the honest floor -- the code you would write by hand. The reader matches it and adds the schema door, endianness, and bounds validation for free; `laneOf` goes below it.
+
+| Read surface | ns/row | Allocation |
+| ------------ | -----: | ---------- |
+| plain `DataView` loop (the floor) | ~0.85 | 0 B/op |
+| `getX` (random access) | ~1.0 | **0 B/op** |
+| `seek` + cursor | ~1.5 | **0 B/op** |
+| `readRow` into a reused sink | ~11 | **0 B/op** |
+| `get` (data-driven dispatch) | ~9.5 | **0 B/op** |
+| **`laneOf` view read** (aligned f32 column) | **~0.57** | **0 B/op** |
+| plain `DataView` loop (same f32 column) | ~0.61 | 0 B/op |
+
+`laneOf` reads a raw `Int16Array`/`Float32Array` view -- it is *faster* than a `DataView` loop and is the path for the absolute hot loop over one aligned column. The `0 B/op` claim is proven independently and more strictly by the torture gate (`@zakkster/lite-leak` + `@zakkster/lite-gc-profiler` under `--expose-gc`), which holds every read surface to 0 B/op **and** 0 retained bytes; the bench's coarser `heapUsed`-delta sampling corroborates it.
+
+### Fast + zero-GC: vs comparable read libraries
+
+Same tightly-packed little-endian record (the one layout every library reads natively), decode all records and read four fields. These libraries **materialize a JS object per record by design** -- that allocation is inherent to their model, not a defect; the transient column is the cost of that model on a read-only primitive workload.
+
+| Library | ns/row | Transient/op | vs `lite-binary-reader` |
+| ------- | -----: | -----------: | ----------------------- |
+| **`lite-binary-reader` `getX`** | **~1.0** | **0 B** | 1.0x |
+| `binary-parser` (bulk `.array`) | ~8.6 | ~3 B/row | ~**8.6x** slower, allocates |
+| `restructure` (bulk `Array`) | ~590 | ~25 B/row | ~590x slower, allocates |
+| `typed-struct` (per-record view) | ~1470 | ~22 B/row | ~1470x slower, allocates |
+
+The fair, marquee comparison is **`binary-parser`** -- a real bulk binary parser built for exactly this: ~8.6x slower and ~3 B/row where the reader allocates nothing. `restructure` (a `DecodeStream`-based format parser) and `typed-struct` (a lazy `Proxy`-accessor view) are reported for completeness; their models are not built for bulk primitive decode, so those multipliers reflect a workload fit, not a like-for-like engine race, and are not leaned on. Write-only encoders and framework-coupled readers are excluded, as is any library that will not install.
+
+### Tiny: footprint + runtime dependencies
+
+| Package | Footprint | Runtime deps |
+| ------- | --------- | :----------: |
+| **`@zakkster/lite-binary-reader`** | **9.5 KB gzip** (one shipped file; 36 KB tarball, 7 files) | **0** |
+| `binary-parser@2.3.0` | ~269 KB installed | 0 |
+| `restructure@3.0.2` | ~199 KB installed | 0 |
+| `typed-struct@2.7.3` | ~484 KB installed | 0 |
+
+All four are dependency-free; the differentiator is size -- one small file versus a 200-500 KB install.
+
+### Saves traffic: fixed-stride binary vs JSON
+
+The bakers (`lite-bake` / `lite-bake-stream`) *produce* the compact bytes; this reader is what makes *consuming* them zero-copy and zero-GC. For 20,000 of the record above:
+
+| Payload | On the wire | gzipped | Decode 20k records | Alloc |
+| ------- | ----------- | ------- | ------------------ | ----- |
+| fixed-stride binary (11 B/record) | **220 KB** | ~217 KB | **~1 ns/record** (`getX`) | **0 B** |
+| JSON | ~1.13 MB (**5.2x** larger) | ~390 KB (~1.8x) | ~110 ns/record (`JSON.parse` + read) | ~6 B/record |
+
+Compact bytes on the wire, and ~100x cheaper to consume once they arrive -- with no allocation.
+
+### The endianness split-class question, answered with data
+
+A recurring suggestion is to split the getters into hardcoded little-endian and big-endian classes so `DataView.getX` receives a literal byte order instead of the reader's dynamic `_le` flag. The bench measures it directly: a literal-endianness getter is ~4% faster than the dynamic one **in an isolated loop** (repeatable across runs). But the shipped `getF32` -- which reads `this._le` -- already matches a hand-written `DataView` loop every run, so there is no penalty in the method callers actually use, and `laneOf` already beats the `DataView` floor for any hot loop. A split class would roughly double the hot-getter surface (eight types x two byte orders) in a module whose rule is "bytes in a hot body, not instructions," to chase a micro-gain that does not appear in `getF32` and is superseded by `laneOf`. **Not adopted** -- the decision is recorded with its numbers in `decisions/0008-benchmark.md`.
+
+---
+
 ## Design decisions worth knowing
 
 - **A non-full-span view is copied, not aliased (BR-07).** An `ArrayBuffer` and a full-span zero-offset view unwrap zero-copy. But a pooled/offset view, or a zero-offset PARTIAL view (`new Uint8Array(buf, 0, 8)`), is copied to its own window. Otherwise a derived or explicit `count` could address bytes past the window the view actually owns. The resolved buffer is therefore always exactly the bytes the caller handed over.
@@ -425,16 +495,17 @@ npm run demo:scope       # oscilloscope (browser): serves the repo; open the pri
 
 ## Testing
 
-**96 deterministic tests, all pass**, plus a torture gate that proves leak-freedom (now including a schema-space fuzzer) and a controls run that proves the door.
+**98 deterministic tests, all pass**, plus a torture gate that proves leak-freedom (now including a schema-space fuzzer) and a controls run that proves the door.
 
 ```bash
-npm test                 # 96 node:test cases (contract + boundary + drift guard + cooperation proof + streaming adapter + hardening gates)
+npm test                 # 98 node:test cases (contract + boundary + drift guard + cooperation proof + streaming adapter + hardening gates)
 npm run torture          # @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints "ok"
 npm run torture:controls # the door + coherence controls (every gate can fail)
 npm run verify           # test + torture + controls, the publish gate
+npm run bench            # reproducible benchmark (see Performance) -- repo-only, needs --expose-gc
 ```
 
-The suites cover: read fidelity across every type code and both endiannesses; the full fail-closed construction door (every `R_*` path, including detached-buffer BR-08/BR-09, the unaligned-offset read, the derived-vs-explicit stride and count, and the partial-view copy BR-07); the `bytes()` escape hatch and its bounds; the sibling constructors against malformed input; the cursor, `readRow`, and variable-length surfaces (cursor-vs-`getX` parity, the `readRow` door and its reentrancy, and variable-length spans at nonzero-base and partial-view sources); the typed-lane fast path (`laneOf` eligibility and its decline contract on unaligned, odd-stride, opposite-endian, and out-of-range fields, plus lane-vs-`getX` parity including a BR-07 partial-window source); and the `.d.ts` drift guard (code-union, export, and version parity, with mutation controls). The torture harness runs read-fidelity, degenerate-layout, an adversarial source-x-count-x-offset door matrix asserting throws-iff-incoherent across every source kind (including detached and `DataView`), a cursor-vs-`getX` differential, a lane-vs-`getX` differential across the alignment-x-endianness-x-type matrix (with a stride-mutation control for teeth), per-surface zero-alloc and retained-alloc gates, and a soak witness. `LBR_TORTURE_BREAK=1` injects a retained allocation to prove the gate can fail; no gate output is a FAIL. The cooperation proof (0.5.0) adds node:test suites that read the siblings' REAL output -- `fromBaked` cell-for-cell vs `@zakkster/lite-bake`'s own Reader over mock fixtures spanning all 8 lanes plus NaN/+/-Infinity/-0, `fromLBK1Shard` vs `@zakkster/lite-bake-stream` (F64 bit-exact, U32 as a string-table index, a no-translate control asserted to diverge), a same-schema shard union, a parent/children multi-reader join, and an assertion that `Reader.js` imports no sibling (the siblings are `file:` devDependencies of the test only). The streaming adapter (0.6.0) adds a peer-surface guard and a `streamQuery` suite: a FOREIGN feed decoded per window through `LiteBinaryReader` and observed in order, abort-on-detach that cancels the in-flight source (no value after abort), reactive-key restart, a `fromLBK1Shard` shard read inside the stream (F64 bit-exact vs bake-stream's own Reader), the structural zero-alloc frame path, and the D9 copy-what-you-keep ownership boundary -- with lite-query a test-only devDependency and no import edge. The 0.6.1 hardening pass adds a torture t8 schema-space fuzzer (thousands of RANDOM legal schemas -- random lane subsets, orders, unaligned offsets, strides, LE/BE -- read cell-for-cell against a `DataView` oracle with a seed-replayable teeth control), a `bytes()` negative gate (it mints a fresh view per call, so it stays a cold-path allocator and can never be quietly folded into the zero-GC hot path), and a README-code subset gate (every `R_*` the docs name is one the reader actually throws).
+The suites cover: read fidelity across every type code and both endiannesses; the full fail-closed construction door (every `R_*` path, including detached-buffer BR-08/BR-09, the unaligned-offset read, the derived-vs-explicit stride and count, and the partial-view copy BR-07); the `bytes()` escape hatch and its bounds; the sibling constructors against malformed input; the cursor, `readRow`, and variable-length surfaces (cursor-vs-`getX` parity, the `readRow` door and its reentrancy, and variable-length spans at nonzero-base and partial-view sources); the typed-lane fast path (`laneOf` eligibility and its decline contract on unaligned, odd-stride, opposite-endian, and out-of-range fields, plus lane-vs-`getX` parity including a BR-07 partial-window source); and the `.d.ts` drift guard (code-union, export, and version parity, with mutation controls). The torture harness runs read-fidelity, degenerate-layout, an adversarial source-x-count-x-offset door matrix asserting throws-iff-incoherent across every source kind (including detached and `DataView`), a cursor-vs-`getX` differential, a lane-vs-`getX` differential across the alignment-x-endianness-x-type matrix (with a stride-mutation control for teeth), per-surface zero-alloc and retained-alloc gates, and a soak witness. `LBR_TORTURE_BREAK=1` injects a retained allocation to prove the gate can fail; no gate output is a FAIL. The cooperation proof (0.5.0) adds node:test suites that read the siblings' REAL output -- `fromBaked` cell-for-cell vs `@zakkster/lite-bake`'s own Reader over mock fixtures spanning all 8 lanes plus NaN/+/-Infinity/-0, `fromLBK1Shard` vs `@zakkster/lite-bake-stream` (F64 bit-exact, U32 as a string-table index, a no-translate control asserted to diverge), a same-schema shard union, a parent/children multi-reader join, and an assertion that `Reader.js` imports no sibling (the siblings are test-only devDependencies). The streaming adapter (0.6.0) adds a peer-surface guard and a `streamQuery` suite: a FOREIGN feed decoded per window through `LiteBinaryReader` and observed in order, abort-on-detach that cancels the in-flight source (no value after abort), reactive-key restart, a `fromLBK1Shard` shard read inside the stream (F64 bit-exact vs bake-stream's own Reader), the structural zero-alloc frame path, and the D9 copy-what-you-keep ownership boundary -- with lite-query a test-only devDependency and no import edge. The 0.6.1 hardening pass adds a torture t8 schema-space fuzzer (thousands of RANDOM legal schemas -- random lane subsets, orders, unaligned offsets, strides, LE/BE -- read cell-for-cell against a `DataView` oracle with a seed-replayable teeth control), a `bytes()` negative gate (it mints a fresh view per call, so it stays a cold-path allocator and can never be quietly folded into the zero-GC hot path), and a README-code subset gate (every `R_*` the docs name is one the reader actually throws). The 0.7.0 pass extends this: the t8 fuzzer now also fills a `readRow` sink at a random row per schema and asserts every cell `Object.is`-equal to the oracle across BOTH an `Array` and a `Float64Array` sink (so `readRow` inherits the same NaN/-0 fidelity `getX` had), a focused unit test pins `readRow` and the cursor bit-exact for the IEEE 754 edge values (`NaN`, `-0`, `+/-Infinity`), and a post-construction-detach test proves that transferring an `ArrayBuffer` away after a reader is built makes a subsequent read throw a CATCHABLE error (no native crash, no silent poison) -- the complement to the construction-time `BR-08`/`BR-09` doors.
 
 ---
 

@@ -32,6 +32,10 @@ export async function run() {
   const lanesSeen = new Array(8).fill(false);
   const endianSeen = { true: false, false: false };
   let comparisons = 0;
+  let rrCells = 0;
+  // Reused readRow sinks (an Array and a TypedArray path), sized to MAX_FIELDS.
+  const rrArr = new Array(MAX_FIELDS);
+  const rrF64 = new Float64Array(MAX_FIELDS);
 
   for (let s = 0; s < N_SCHEMAS; s++) {
     const nFields = 1 + rnd(MAX_FIELDS);
@@ -77,6 +81,25 @@ export async function run() {
         ', seed ' + SEED + ', draw ' + s + ')');
       comparisons++;
     }
+
+    // readRow fuzz: fill BOTH sink kinds at a random row and assert every cell is
+    // bit-exact (Object.is) vs the oracle -- readRow copies getX results with no
+    // transformation, so NaN/-0 (which the random bytes produce on float lanes)
+    // must survive into an Array AND a Float64Array sink identically.
+    {
+      const row = rnd(count);
+      const sink = (s & 1) ? rrArr : rrF64;
+      const ret = reader.readRow(row, sink);
+      check(ret === sink, () => 't8: readRow did not return its sink (seed ' + SEED + ', draw ' + s + ')');
+      for (let i = 0; i < nFields; i++) {
+        const want = oracleRead(refDv, schema[i].type, row * stride + schema[i].offset, le);
+        check(Object.is(sink[i], want), () => 't8: readRow MISMATCH field ' + i + ' type ' +
+          schema[i].type + ' row ' + row + ' -> got ' + sink[i] + ' want ' + want +
+          ' (' + ((s & 1) ? 'Array' : 'Float64Array') + ' sink, off ' + schema[i].offset +
+          ', le ' + le + ', seed ' + SEED + ', draw ' + s + ')');
+        rrCells++;
+      }
+    }
   }
 
   // --- non-vacuity: the draws must have spanned all 8 lanes and both endiannesses
@@ -86,6 +109,7 @@ export async function run() {
   check(endianSeen.true && endianSeen.false, () => 't8: not both endiannesses exercised');
   check(comparisons >= N_SCHEMAS * READS_PER_SCHEMA * 0.99,
     () => 't8: only ' + comparisons + ' comparisons -- suspiciously few');
+  check(rrCells >= N_SCHEMAS, () => 't8: only ' + rrCells + ' readRow cells -- coverage gap');
 
   // --- teeth: a deliberately WRONG offset must DIVERGE from the oracle ---------
   // Two distinct U32 fields; reading field 1's oracle position for field 0's

@@ -31,8 +31,8 @@ function assertCode(fn, code) {
     'expected a LiteBinaryReaderError with code ' + code);
 }
 
-test('VERSION is the shipped v0.6.2 string', () => {
-  assert.equal(VERSION, '0.6.2');
+test('VERSION is the shipped v0.7.0 string', () => {
+  assert.equal(VERSION, '0.7.0');
 });
 
 // --- S4 (v0.3.0): the cursor, readRow, and variable-length surfaces ----------
@@ -92,10 +92,67 @@ test('A2: readRow fills out[i]===get(r,i) into a reused Array and a Float64Array
     for (let r = 0; r < 64; r++) {
       const ret = rd.readRow(r, out);
       assert.equal(ret, out); // returns the same sink
-      for (let i = 0; i < 8; i++) assert.ok(out[i] === rd.get(r, i), 'readRow cell mismatch r=' + r + ' i=' + i);
+      for (let i = 0; i < 8; i++) assert.ok(Object.is(out[i], rd.get(r, i)), 'readRow cell mismatch r=' + r + ' i=' + i);
       assert.equal(out.length, 8); // never grew
     }
   }
+});
+
+test('readRow / cursor are bit-exact for IEEE 754 edge values (NaN, -0, +/-Infinity)', () => {
+  // readRow copies getX results with NO transformation; prove it preserves the
+  // IEEE 754 edge values that === cannot distinguish, into BOTH an Array and a
+  // Float64Array sink, and that the cursor reads them identically. The bytes are
+  // hand-placed so each expected value is known exactly (Object.is, not ===).
+  const f64vals = [NaN, -0, 0, Infinity, -Infinity, 1.5];
+  const f32vals = [NaN, -0, Infinity, -Infinity, 0.5, -0.25];
+  const rows = f64vals.length;
+  const schema = [
+    { name: 'd', type: T_F64, offset: 0 },
+    { name: 'f', type: T_F32, offset: 8 },
+    { name: 'b', type: T_U8, offset: 12 },
+  ];
+  const stride = 13;
+  const buf = new ArrayBuffer(stride * rows);
+  const dv = new DataView(buf);
+  for (let r = 0; r < rows; r++) {
+    dv.setFloat64(r * stride + 0, f64vals[r], true);
+    dv.setFloat32(r * stride + 8, f32vals[r], true);
+    dv.setUint8(r * stride + 12, r);
+  }
+  const rd = new LiteBinaryReader(buf, { schema, stride });
+  for (const makeSink of [() => new Array(3), () => new Float64Array(3)]) {
+    const out = makeSink();
+    for (let r = 0; r < rows; r++) {
+      rd.readRow(r, out);
+      assert.ok(Object.is(out[0], rd.getF64(r, 0)), 'readRow f64 edge r=' + r);
+      assert.ok(Object.is(out[1], rd.getF32(r, 1)), 'readRow f32 edge r=' + r);
+      assert.ok(Object.is(out[2], rd.getU8(r, 2)), 'readRow u8 r=' + r);
+    }
+  }
+  for (let r = 0; r < rows; r++) {
+    rd.seek(r);
+    assert.ok(Object.is(rd.f64(0), rd.getF64(r, 0)), 'cursor f64 edge r=' + r);
+    assert.ok(Object.is(rd.f32(1), rd.getF32(r, 1)), 'cursor f32 edge r=' + r);
+    assert.ok(Object.is(rd.val(0), rd.get(r, 0)), 'cursor val f64 edge r=' + r);
+  }
+  // non-vacuity: the NaN and -0 cells really are in the buffer (we tested them, not +0)
+  assert.ok(Number.isNaN(rd.getF64(0, 0)) && Object.is(rd.getF64(1, 0), -0), 'edge fixture is vacuous');
+});
+
+test('post-construction detach: getX on a detached buffer throws catchably (no native crash), not silent poison', () => {
+  // BR-08/BR-09 refuse a buffer detached BEFORE construction with a coded R_BAD_SOURCE.
+  // This pins the OTHER timeline: a reader built over a LIVE ArrayBuffer whose buffer
+  // is transferred away AFTER construction. The hot path is unchecked by contract, so
+  // this is NOT a coded R_* -- but it must be a CATCHABLE JS throw (V8's own DataView
+  // guard), never a native crash and never a silently-wrong read. The process staying
+  // alive to finish the suite is itself the proof it did not segfault. (A SharedArrayBuffer
+  // cannot reach this state at all -- it is non-transferable by spec.)
+  const buf = new ArrayBuffer(16);
+  new DataView(buf).setFloat64(0, 42.5, true);
+  const rd = new LiteBinaryReader(buf, { schema: [{ name: 'x', type: T_F64, offset: 0 }] });
+  assert.equal(rd.getF64(0, 0), 42.5); // reads correctly while the buffer is live
+  structuredClone(buf, { transfer: [buf] }); // detach buf out from under the reader
+  assert.throws(() => rd.getF64(0, 0), (e) => e instanceof Error); // catchable, not a crash
 });
 
 test('A3: readRow refuses a too-short / non-indexable sink with R_BAD_LENGTH', () => {

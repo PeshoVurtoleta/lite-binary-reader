@@ -7,7 +7,7 @@ fields with NO allocation, at ANY byte offset, with EXPLICIT endianness. Reads
 through a DataView, so a field may sit at an odd (unaligned) offset a typed-array
 lane cannot address. Single-file ESM, zero runtime dependencies, node:test only.
 
-## Status: 0.6.2 - S7c: demos (standalone foreign-bytes + compound pipeline)
+## Status: 0.7.0 - S13: benchmark suite (fast / zero-GC / tiny / saves-traffic; split-class closed)
 
 S0 landed the reader and the sibling constructors. S1 hardened the construction
 door (BR-01..BR-04). S2 closed the view-window and sibling-shape holes
@@ -181,11 +181,11 @@ carries a coded `R_*` tag on `error.code`:
                     bytes() span reads past the buffer
 - R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
 
-## API (0.6.2)
+## API (0.7.0)
 
 Named exports from `@zakkster/lite-binary-reader`:
 
-- VERSION: '0.6.2'
+- VERSION: '0.7.0'
 - IS_LITTLE_ENDIAN: boolean (host byte order, detected once)
 - T_F32=0, T_F64=1, T_I32=2, T_I16=3, T_I8=4, T_U32=5, T_U16=6, T_U8=7
 - LiteBinaryReaderError: Error subclass; `.code` carries the R_* tag
@@ -291,23 +291,55 @@ allocation and the gate rejects it (a gate that cannot fail is decorative).
 
 ## Testing
 
-- npm test        -- 96 node:test cases (contract + boundary + drift + cooperation
+- npm test        -- 98 node:test cases (contract + boundary + drift + cooperation
   proof: coop-bake / coop-lbk1 / coop-multireader / coop-join + no-import-edge; S6
   streaming adapter: coop-query + peer-surface; S7b: bytes() cold-path gate +
-  README-code subset gate)
+  README-code subset gate; readRow/cursor IEEE-754 edge fidelity (NaN/-0/+-Inf,
+  Object.is, both sink kinds) + post-construction detach throws catchably)
 - npm run torture -- @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints `ok`;
   tiers t0/t1/t2/t5/t6/t7/t9 plus t8 schema-space fuzz (thousands of RANDOM legal
-  schemas vs a DataView oracle, seed-replayable)
+  schemas vs a DataView oracle, seed-replayable; getX AND readRow into both an Array
+  and a Float64Array sink, Object.is so NaN/-0 cannot slip)
 - npm run torture:controls -- the door/coherence controls
 - npm run verify  -- test + torture + controls, the publish gate
 - npm run demo     -- standalone demo: a foreign big-endian UNALIGNED-f32 wire packet
   read zero-GC + the laneOf fast path (demo/standalone.mjs, repo-only)
 - node demo/compound.mjs -- ecosystem pipeline: lite-bake bakes a parent + children
   table -> one reader each via fromBaked -> caller-side join -> lite-query streamQuery
-  decodes rows reactively (repo-only; lite-bake/lite-query are demo-only file: devDeps)
+  decodes rows reactively (repo-only; lite-bake/lite-query are demo-only devDeps)
 - npm run demo:scope -- browser OSCILLOSCOPE (demo/index.html): a packed i16 capture
   buffer decoded to live canvas traces via laneOf (0 DataView calls/sample), with a
   host/big-endian source toggle (getI16 byte-swap path); imports only ../Reader.js
+- npm run bench   -- benchmark (bench/bench.mjs, repo-only, node --expose-gc): the
+  four value axes, seed-replayable; peers (binary-parser/typed-struct/restructure)
+  are bench-only devDeps
+
+## Performance (S13, decisions/0008; bench/bench.mjs, repo-only)
+
+Reproducible via `npm run bench` (advisory wall-clock; deterministic bytes/op). One
+run, Node 26, LE host, 20,000 records/pass. Every contender is checked cell-for-cell
+against a DataView oracle BEFORE its timings count (exact-value fairness gate).
+
+- FAST + ZERO-GC (read surfaces vs a hand-written DataView loop, the honest floor):
+  getX ~1.0 ns/row (~=baseline), seek+cursor ~1.5, readRow-into-reused-sink ~11, get
+  ~9.5, laneOf ~0.57 (BELOW the DataView floor). All 0 B/op (torture gate is the hard
+  proof; the bench corroborates).
+- vs comparable read libraries (same tight LE record; peers materialize a JS object
+  per record by design): binary-parser (the fair marquee, a bulk parser) ~8.6x slower
+  + ~3 B/row vs our 0 B; restructure ~590x, typed-struct ~1470x -- reported for
+  completeness with the caveat that their models (DecodeStream / lazy Proxy view) are
+  not built for bulk primitive decode, so those multipliers are NOT leaned on.
+- TINY: one 9.5 KB (gzip) shipped file, 0 runtime deps, vs 199-484 KB installed peers.
+- SAVES TRAFFIC: fixed-stride binary (11 B/record) vs JSON -- 5.2x smaller raw, ~1.8x
+  gzipped, and ~100x cheaper to consume (~1 ns/record getX + 0 B vs ~110 ns/record
+  JSON.parse + ~6 B/record). Honest framing: the bakers PRODUCE the bytes; this reader
+  makes CONSUMING them zero-copy / zero-GC.
+- SPLIT-CLASS question CLOSED (negative result): a literal-endianness getter is ~4%
+  faster than the dynamic-_le getter in an isolated loop (repeatable), but the shipped
+  getF32 (which reads this._le) ALREADY matches a hand-written DataView loop every run,
+  and laneOf already beats the floor -- so a split LE/BE class would double the
+  hot-getter surface for a fallback-only micro-gain callers do not see. Not adopted;
+  Reader.js stays byte-identical (VERSION const only, 0.6.2 -> 0.7.0).
 
 ## Composability
 

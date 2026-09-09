@@ -210,7 +210,7 @@ export async function run() {
   expectCode(() => rr.readRow(0, new Array(1)), 'R_BAD_LENGTH', 'readRow too-short sink');
   const rrOut = new Array(2);
   check(rr.readRow(0, rrOut) === rrOut, () => 't2: readRow did not return its out sink');
-  check(rrOut[0] === rr.get(0, 0) && rrOut[1] === rr.get(0, 1), () => 't2: readRow filled cells wrong');
+  check(Object.is(rrOut[0], rr.get(0, 0)) && Object.is(rrOut[1], rr.get(0, 1)), () => 't2: readRow filled cells wrong');
   check(rrOut.length === 2, () => 't2: readRow grew the out sink to ' + rrOut.length);
 
   // variable-length bytes(row,id): 2-arg equals 3-arg for the sibling value.

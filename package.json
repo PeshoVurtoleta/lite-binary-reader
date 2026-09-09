@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-binary-reader",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Tiny, zero-dependency, zero-GC reader for raw or foreign binary buffers: point it at an ArrayBuffer + an offsets/type table and read fields with no allocation, any byte offset, explicit endianness.",
   "type": "module",
   "main": "./Reader.js",
@@ -30,7 +30,8 @@
     "verify": "npm test && npm run torture && npm run torture:controls",
     "demo": "node demo/standalone.mjs",
     "demo:compound": "node demo/compound.mjs",
-    "demo:scope": "npx serve ."
+    "demo:scope": "npx serve .",
+    "bench": "node --expose-gc bench/bench.mjs"
   },
   "keywords": [
     "binary",
@@ -72,7 +73,10 @@
     "@zakkster/lite-leak": "^1.10.0",
     "@zakkster/lite-query": "^2.2.0",
     "@zakkster/lite-signal": "^1.5.0",
-    "@zakkster/lite-stream": "^1.4.0"
+    "@zakkster/lite-stream": "^1.4.0",
+    "binary-parser": "^2.3.0",
+    "restructure": "^3.0.2",
+    "typed-struct": "^2.7.3"
   },
   "engines": {
     "node": ">=18"

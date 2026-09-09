@@ -2,6 +2,65 @@
 
 All notable changes to `@zakkster/lite-binary-reader`.
 
+## 0.7.0
+
+Benchmark suite: no runtime change. `Reader.js` is byte-identical to 0.6.2 (only its
+`VERSION` const moves, 0.6.2 -> 0.7.0). Brought forward ahead of the 1.0.0 freeze so
+the endianness split-class question could be answered before the contract locks. The
+benchmark and its comparison peers are repo-only (excluded from the tarball -- shipped
+file list stays 7).
+
+### Added
+- `bench/bench.mjs` (`npm run bench`, `node --expose-gc bench/bench.mjs`): a
+  reproducible, seed-replayable benchmark across the four value axes. Modeled on
+  `../LiteQuery/bench/bench.mjs` -- warmup, `gc()`-bracketed `process.hrtime.bigint()`
+  timing, and both transient and retained bytes/op columns. Every contender is verified
+  to decode identical values (an exact checksum vs a `DataView` oracle) before its
+  timings are trusted; a `SUMMARY_JSON` footer is emitted for tooling.
+  - FAST + ZERO-GC: every read surface vs a hand-written `DataView` loop -- `getX`
+    matches the baseline, `laneOf` beats it, all at 0 B/op.
+  - vs comparable read libraries on the same tight little-endian record:
+    `binary-parser` (the fair marquee, a bulk parser) ~8.6x slower and ~3 B/row where
+    the reader allocates nothing; `restructure` and `typed-struct` reported for
+    completeness with caveats (their object/lazy-view models are not built for bulk
+    primitive decode).
+  - TINY: one 9.5 KB (gzip) shipped file, 0 deps, vs 199-484 KB installed peers.
+  - SAVES TRAFFIC: fixed-stride binary vs JSON -- ~5.2x smaller raw, ~1.8x gzipped, and
+    ~100x cheaper to decode with zero allocation.
+- `README.md` `## Performance` section (blueprint spine) + a top-of-file headline
+  blockquote citing the multipliers; `llms.txt` Performance section.
+- `decisions/0008-benchmark.md`: methodology, fairness discipline, and the split-class
+  decision with its data.
+- `binary-parser`, `typed-struct`, `restructure` as bench-only devDependencies (the
+  comparison peers; not shipped, no runtime dependency added).
+
+### Tests (hardening, prompted by an external review)
+- `readRow` IEEE-754 edge fidelity: the t8 schema fuzzer now also fills a `readRow`
+  sink at a random row per schema and asserts every cell `Object.is`-equal to the
+  `DataView` oracle across BOTH an `Array` and a `Float64Array` sink -- so `readRow`
+  inherits the same NaN/-0 bit-exactness `getX` already had. A focused unit test pins
+  `readRow` and the cursor against `NaN`, `-0`, and `+/-Infinity` explicitly.
+- `readRow` assertions in `test/torture/t2-adversarial.mjs` and `test/Reader.test.js`
+  (A2) changed from `===` to `Object.is` (a `===` cell check silently can neither
+  prove NaN/-0 fidelity nor survive a NaN fixture).
+- Post-construction detach: a new test proves that transferring an `ArrayBuffer` away
+  AFTER a reader is built makes a subsequent read throw a CATCHABLE error (no native
+  crash, no silent poison) -- the complement to the construction-time `BR-08`/`BR-09`
+  doors. (A `SharedArrayBuffer` cannot reach this state; it is non-transferable.)
+- Test count 96 -> 98. No `Reader.js` behavioural change.
+
+### Changed
+- `README.md`, `llms.txt`, `CHANGELOG.md`, `package.json`, `Reader.js` `VERSION`,
+  `test/Reader.test.js` version assertion synced to 0.7.0; test count 96 -> 98.
+
+### Decided (not built)
+- The endianness split-class idea (hardcoded-LE / hardcoded-BE getter classes) was
+  measured and CLOSED. A literal-endianness getter is ~4% faster in an isolated loop
+  (repeatable), but the shipped `getF32` already matches a hand-written `DataView` loop
+  and `laneOf` already beats the floor, so the ~4% does not appear in the method callers
+  use. Splitting would double the hot-getter surface for a fallback-only micro-gain.
+  Reader.js stays byte-identical. Recorded in `decisions/0008-benchmark.md`.
+
 ## 0.6.2
 
 Demos: no runtime change. `Reader.js` is byte-identical to 0.6.1 (only its `VERSION`

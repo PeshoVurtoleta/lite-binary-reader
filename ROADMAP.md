@@ -847,9 +847,22 @@ DONE WHEN
 # S13 -- benchmark suite + headline numbers (vs similar modules)  [also a decision gate]
 ===============================================================================
 ```markdown
-status: planned (post-1.0)
-depends_on: [S8]
+status: DONE as v0.7.0 (brought forward AHEAD of S8, by maintainer choice, so any
+        hot-path change it surfaced would land before the 1.0.0 freeze)
+depends_on: [S8]   # reordered: done before S8; 1.0.0 now ships WITH the numbers
 ```
+OUTCOME (v0.7.0, decisions/0008): `bench/bench.mjs` (`npm run bench`) built on the
+LiteQuery blueprint -- four axes (FAST / ZERO-GC / TINY / SAVES-TRAFFIC), seed-
+replayable, exact-checksum fairness gate vs a DataView oracle. Peers (D1): DataView
+baseline + binary-parser (fair marquee, ~8.6x slower + allocates) + typed-struct +
+restructure (reported with caveats), all bench-only devDeps. README `## Performance`
++ top headline + llms.txt landed. THE SPLIT-CLASS EXPERIMENT was run and CLOSED
+(negative result): a literal-endianness getter is ~4% faster in an isolated loop
+(repeatable), but the shipped getF32 already matches a hand-written DataView loop and
+laneOf already beats the floor, so the micro-gain does not appear in the method
+callers use -- not worth doubling the hot-getter surface. Reader.js stayed byte-
+identical (VERSION const only). S8 (1.0.0) is now the next and final pre-post-1.0
+session, shipping the frozen contract with the benchmark numbers already in the docs.
 PURPOSE
   Publishable, REPRODUCIBLE numbers that PROVE the module's reason to exist across its
   four value axes -- not just ns/op:
