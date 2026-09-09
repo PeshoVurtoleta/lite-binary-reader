@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lite-binary-reader -- oscilloscope demo</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0b0f10; color: #cfe8d8;
+    font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; align-items: center; padding: 24px 16px 48px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; color: #eafff2; letter-spacing: .5px; }
+  .sub { color: #6f8f7f; margin: 0 0 18px; text-align: center; max-width: 760px; }
+  .sub code { color: #9fe3bf; }
+  .scope { position: relative; border: 1px solid #1d2b25; border-radius: 8px; box-shadow: 0 0 40px #04120c inset; }
+  canvas { display: block; border-radius: 8px; }
+  .panel { display: flex; flex-wrap: wrap; gap: 18px 26px; align-items: center; justify-content: center; margin-top: 16px; max-width: 820px; }
+  .ctrl { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #8fb3a1; }
+  .ctrl label { text-transform: uppercase; letter-spacing: .6px; font-size: 10px; color: #5f7f6f; }
+  input[type=range] { width: 140px; accent-color: #37e08a; }
+  button { font: inherit; font-size: 13px; background: #12261c; color: #9fe3bf; border: 1px solid #275; border-radius: 6px; padding: 6px 14px; cursor: pointer; }
+  button:hover { background: #17301f; }
+  .toggle.on { background: #113; border-color: #46f; color: #bcd0ff; }
+  .readout { margin-top: 18px; max-width: 820px; width: 100%; border-top: 1px solid #1d2b25; padding-top: 14px; font-size: 12px; color: #7fa591; }
+  .readout b { color: #cfe8d8; font-weight: 600; }
+  .legend { display: inline-flex; gap: 4px; align-items: center; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .foot { margin-top: 22px; color: #46604f; font-size: 11px; }
+  .path { color: #37e08a; } .path.getx { color: #ffcf5a; }
+</style>
+</head>
+<body>
+  <h1>lite-binary-reader &mdash; oscilloscope</h1>
+  <p class="sub">
+    A packed binary capture &mdash; three <code>i16</code> channels interleaved at
+    <code>stride 6</code> &mdash; is written into an <code>ArrayBuffer</code> each frame, exactly as an
+    ADC or a wire device would deliver it. <code>LiteBinaryReader</code> decodes it and draws the
+    traces. The render loop reads through <code>laneOf()</code> (a raw <code>Int16Array</code> view) &mdash;
+    <b>zero <code>DataView</code> calls, zero allocation per sample.</b>
+  </p>
+
+  <div class="scope"><canvas id="scope" width="820" height="380"></canvas></div>
+
+  <div class="panel">
+    <button id="run" class="toggle on">Running</button>
+    <div class="ctrl"><label>Time / div (samples)</label><input id="tb" type="range" min="128" max="1024" step="128" value="512"></div>
+    <div class="ctrl"><label>Ch0 frequency</label><input id="f0" type="range" min="1" max="20" step="1" value="3"></div>
+    <div class="ctrl"><label>Ch0 amplitude</label><input id="a0" type="range" min="10" max="100" step="5" value="80"></div>
+    <div class="ctrl"><label>Noise</label><input id="nz" type="range" min="0" max="40" step="2" value="8"></div>
+    <button id="endian" class="toggle">Source: host-endian</button>
+  </div>
+
+  <div class="readout" id="readout"></div>
+  <p class="foot">demo/index.html &mdash; repo-only, served with <code>npx serve demo</code>. The reader imports no sibling; this page imports only <code>../Reader.js</code>.</p>
+
+<script type="module">
+import { LiteBinaryReader, T_I16, IS_LITTLE_ENDIAN } from "../Reader.js";
+
+const cv = document.getElementById("scope");
+const ctx = cv.getContext("2d");
+const W = cv.width, H = cv.height;
+
+const CH = 3, BYTES = 2, STRIDE = CH * BYTES;   // 3x i16 interleaved
+const COLORS = ["#37e08a", "#4fd0ff", "#ffcf5a"];
+const NAMES = ["ch0 sine", "ch1 square", "ch2 saw+noise"];
+
+// State from the controls.
+const S = { running: true, samples: 512, f0: 3, a0: 80, noise: 8, bigEndian: false };
+
+// Capture buffer + reader are built ONCE per (samples, endianness); the render
+// loop rewrites the bytes and re-reads through the same lanes -> 0 alloc/frame.
+let buf, dv, reader, lanes, ids, usingLanes;
+function build() {
+  buf = new ArrayBuffer(S.samples * STRIDE);
+  dv = new DataView(buf);
+  reader = new LiteBinaryReader(buf, {
+    schema: [
+      { name: "ch0", type: T_I16, offset: 0 },
+      { name: "ch1", type: T_I16, offset: 2 },
+      { name: "ch2", type: T_I16, offset: 4 },
+    ],
+    stride: STRIDE,
+    littleEndian: S.bigEndian ? false : IS_LITTLE_ENDIAN,
+  });
+  ids = [reader.field("ch0"), reader.field("ch1"), reader.field("ch2")];
+  // laneOf serves the host-endian aligned case with a raw Int16Array view; a
+  // big-endian ("foreign wire") reader declines -> we fall back to getI16.
+  lanes = ids.map((id) => reader.laneOf(id));
+  usingLanes = lanes.every((l) => l !== null);
+}
+build();
+
+let phase = 0;
+function writeCapture() {
+  const wLE = S.bigEndian ? false : IS_LITTLE_ENDIAN;
+  const n = S.samples;
+  const amp = (S.a0 / 100) * 30000;
+  for (let i = 0; i < n; i++) {
+    const t = (i / n) * Math.PI * 2;
+    const sine = Math.sin(t * S.f0 + phase);
+    const square = Math.sign(Math.sin(t * 2 + phase)) * 0.7;
+    const saw = (((t * 3 + phase) % (Math.PI * 2)) / Math.PI - 1) * 0.7;
+    const nz = () => (Math.random() * 2 - 1) * (S.noise / 100);
+    const base = i * STRIDE;
+    dv.setInt16(base + 0, clamp16(sine * amp + nz() * 30000), wLE);
+    dv.setInt16(base + 2, clamp16(square * 26000 + nz() * 30000), wLE);
+    dv.setInt16(base + 4, clamp16(saw * 24000 + nz() * 30000), wLE);
+  }
+}
+function clamp16(v) { v = v | 0; return v > 32767 ? 32767 : v < -32768 ? -32768 : v; }
+
+// Read a channel sample through the reader: laneOf fast path when available.
+function sample(ch, i) {
+  const l = lanes[ch];
+  if (l) return l.view[i * l.elemStride + l.elemOffset];
+  return reader.getI16(i, ids[ch]);
+}
+
+function grid() {
+  ctx.fillStyle = "#07110c"; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = "#123"; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x <= W; x += W / 10) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = 0; y <= H; y += H / 8) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+  ctx.strokeStyle = "#1c3"; ctx.globalAlpha = .5;
+  ctx.beginPath(); ctx.moveTo(0, H / 2); ctx.lineTo(W, H / 2); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function drawTrace(ch, yMid, yScale) {
+  const n = S.samples;
+  ctx.strokeStyle = COLORS[ch]; ctx.lineWidth = 1.8; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = (i / (n - 1)) * W;
+    const y = yMid - (sample(ch, i) / 32768) * yScale;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.shadowColor = COLORS[ch]; ctx.shadowBlur = 6; ctx.stroke(); ctx.shadowBlur = 0;
+}
+
+let frames = 0, lastFpsT = performance.now(), fps = 0;
+function render() {
+  if (S.running) { writeCapture(); phase += 0.06; }
+  grid();
+  const third = H / 3, yScale = third * 0.42;
+  for (let ch = 0; ch < CH; ch++) drawTrace(ch, third * (ch + 0.5), yScale);
+
+  frames++;
+  const now = performance.now();
+  if (now - lastFpsT >= 500) { fps = Math.round((frames * 1000) / (now - lastFpsT)); frames = 0; lastFpsT = now; }
+  readout();
+  requestAnimationFrame(render);
+}
+
+const readoutEl = document.getElementById("readout");
+function readout() {
+  const bytes = S.samples * STRIDE;
+  const legend = NAMES.map((nm, i) =>
+    `<span class="legend"><span class="swatch" style="background:${COLORS[i]}"></span>${nm}</span>`).join(" &nbsp; ");
+  const path = usingLanes
+    ? `<span class="path">laneOf() -> Int16Array (0 DataView calls / sample)</span>`
+    : `<span class="path getx">getI16() (big-endian wire: laneOf declines, the reader byte-swaps)</span>`;
+  readoutEl.innerHTML =
+    `${legend}<br>` +
+    `<b>${S.samples}</b> samples &times; <b>${CH}</b> ch &times; i16 = <b>${bytes} B</b> decoded per frame &mdash; ` +
+    `decode path: ${path} &mdash; <b>${fps}</b> fps &mdash; <b>0</b> allocations in the render loop.`;
+}
+
+// --- controls ---------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+$("run").onclick = (e) => { S.running = !S.running; e.target.textContent = S.running ? "Running" : "Stopped"; e.target.classList.toggle("on", S.running); };
+$("tb").oninput = (e) => { S.samples = +e.target.value; build(); };
+$("f0").oninput = (e) => { S.f0 = +e.target.value; };
+$("a0").oninput = (e) => { S.a0 = +e.target.value; };
+$("nz").oninput = (e) => { S.noise = +e.target.value; };
+$("endian").onclick = (e) => {
+  S.bigEndian = !S.bigEndian;
+  e.target.textContent = S.bigEndian ? "Source: big-endian wire" : "Source: host-endian";
+  e.target.classList.toggle("on", S.bigEndian);
+  build();
+};
+
+render();
+</script>
+</body>
+</html>

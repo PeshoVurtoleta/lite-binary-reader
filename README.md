@@ -403,6 +403,26 @@ The one cold branch is the throw path: a coded error is built (and its message c
 
 ---
 
+## Demos
+
+Three demos live in `demo/` (repo-only -- not in the npm tarball):
+
+```bash
+npm run demo             # standalone (node): a foreign big-endian wire packet with an
+                         # UNALIGNED f32, read zero-GC, plus the laneOf fast path
+node demo/compound.mjs   # ecosystem pipeline (node): lite-bake bakes a parent + children
+                         # table -> one reader per table via fromBaked -> join by key
+                         # -> lite-query streamQuery decodes the rows reactively
+npm run demo:scope       # oscilloscope (browser): serves the repo; open the printed URL
+                         # at /demo/ -- a live scope decoding a packed i16 capture buffer
+```
+
+- **Standalone** shows the reason this package exists: it reads bytes a typed-array lane and `lite-bake` cannot address (an unaligned offset, big-endian order), allocating nothing per read.
+- **Compound** is the real query-builder scenario -- `bake -> read -> reactive stream`, end to end, with the reader importing no sibling (`lite-bake` and `lite-query` are demo-only `file:` devDependencies).
+- **Oscilloscope** (`demo/index.html`) is the visual one: three `i16` channels are packed into an `ArrayBuffer` each frame like an ADC capture, and `LiteBinaryReader` decodes them into live scope traces -- the render loop reads through `laneOf()` (a raw `Int16Array` view, zero `DataView` calls per sample). A toggle switches the source to big-endian "wire" order, where `laneOf` declines and the reader byte-swaps through `getI16` instead.
+
+---
+
 ## Testing
 
 **96 deterministic tests, all pass**, plus a torture gate that proves leak-freedom (now including a schema-space fuzzer) and a controls run that proves the door.

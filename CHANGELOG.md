@@ -2,6 +2,34 @@
 
 All notable changes to `@zakkster/lite-binary-reader`.
 
+## 0.6.2
+
+Demos: no runtime change. `Reader.js` is byte-identical to 0.6.1 (only its `VERSION`
+const moves). Adds the two runnable demos every A-tier sibling ships; both are
+repo-only (excluded from the tarball -- shipped file list stays 7).
+
+### Added
+- `demo/standalone.mjs` (`npm run demo`): the reader alone -- a foreign big-endian wire
+  packet with an UNALIGNED f32 (a layout a typed-array lane and lite-bake cannot
+  address) read zero-GC, plus the `laneOf` fast path on a host-endian aligned column
+  and its decline on the unaligned/BE field.
+- `demo/compound.mjs` (`node demo/compound.mjs`): the ecosystem pipeline -- `@zakkster/
+  lite-bake` bakes a parent (orders) and children (line items) table separately, one
+  `LiteBinaryReader` per table via `fromBaked`, a caller-side join by key, then a
+  `@zakkster/lite-query` `streamQuery` decoding the rows reactively. Deterministic (no
+  timers/network); lite-bake and lite-query are demo-only `file:` devDependencies, no
+  import edge in the reader.
+- `demo/index.html` (`npm run demo:scope`): a browser OSCILLOSCOPE -- three `i16`
+  channels packed into an `ArrayBuffer` each frame (like an ADC capture) and decoded
+  by `LiteBinaryReader` into live canvas traces; the render loop reads through
+  `laneOf()` (a raw `Int16Array` view, zero `DataView` calls / sample), with an
+  endianness toggle that flips a "big-endian wire" source to the `getI16` byte-swap
+  path (where `laneOf` declines). Imports only `../Reader.js`.
+- README "Demos" section and `demo` / `demo:compound` / `demo:scope` npm scripts.
+
+### Changed
+- `VERSION` 0.6.1 -> 0.6.2 (`Reader.js`, `package.json`, `llms.txt`).
+
 ## 0.6.1
 
 A hardening pass: no runtime change. `Reader.js` moves only its `VERSION` const;

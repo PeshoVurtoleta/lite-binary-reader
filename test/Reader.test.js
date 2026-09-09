@@ -31,8 +31,8 @@ function assertCode(fn, code) {
     'expected a LiteBinaryReaderError with code ' + code);
 }
 
-test('VERSION is the shipped v0.6.1 string', () => {
-  assert.equal(VERSION, '0.6.1');
+test('VERSION is the shipped v0.6.2 string', () => {
+  assert.equal(VERSION, '0.6.2');
 });
 
 // --- S4 (v0.3.0): the cursor, readRow, and variable-length surfaces ----------

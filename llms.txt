@@ -7,7 +7,7 @@ fields with NO allocation, at ANY byte offset, with EXPLICIT endianness. Reads
 through a DataView, so a field may sit at an odd (unaligned) offset a typed-array
 lane cannot address. Single-file ESM, zero runtime dependencies, node:test only.
 
-## Status: 0.6.1 - S7b: pre-1.0 hardening (schema-space fuzz + gates)
+## Status: 0.6.2 - S7c: demos (standalone foreign-bytes + compound pipeline)
 
 S0 landed the reader and the sibling constructors. S1 hardened the construction
 door (BR-01..BR-04). S2 closed the view-window and sibling-shape holes
@@ -181,11 +181,11 @@ carries a coded `R_*` tag on `error.code`:
                     bytes() span reads past the buffer
 - R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
 
-## API (0.6.1)
+## API (0.6.2)
 
 Named exports from `@zakkster/lite-binary-reader`:
 
-- VERSION: '0.6.1'
+- VERSION: '0.6.2'
 - IS_LITTLE_ENDIAN: boolean (host byte order, detected once)
 - T_F32=0, T_F64=1, T_I32=2, T_I16=3, T_I8=4, T_U32=5, T_U16=6, T_U8=7
 - LiteBinaryReaderError: Error subclass; `.code` carries the R_* tag
@@ -300,6 +300,14 @@ allocation and the gate rejects it (a gate that cannot fail is decorative).
   schemas vs a DataView oracle, seed-replayable)
 - npm run torture:controls -- the door/coherence controls
 - npm run verify  -- test + torture + controls, the publish gate
+- npm run demo     -- standalone demo: a foreign big-endian UNALIGNED-f32 wire packet
+  read zero-GC + the laneOf fast path (demo/standalone.mjs, repo-only)
+- node demo/compound.mjs -- ecosystem pipeline: lite-bake bakes a parent + children
+  table -> one reader each via fromBaked -> caller-side join -> lite-query streamQuery
+  decodes rows reactively (repo-only; lite-bake/lite-query are demo-only file: devDeps)
+- npm run demo:scope -- browser OSCILLOSCOPE (demo/index.html): a packed i16 capture
+  buffer decoded to live canvas traces via laneOf (0 DataView calls/sample), with a
+  host/big-endian source toggle (getI16 byte-swap path); imports only ../Reader.js
 
 ## Composability
 
