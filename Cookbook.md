@@ -216,6 +216,102 @@ against lite-bake's own Reader and every child row reached through the join.
 
 ---
 
+## R6 (pro) -- stream a foreign feed into a lite-query `streamQuery`
+
+A remote fixed-stride binary feed that NO baker wrote -- a wire protocol, a sensor
+dump, a column-store page -- pulled in windows and decoded zero-GC as each window
+arrives. `@zakkster/lite-query`'s `streamQuery` subscribes a cache key to an async
+iterable; your `stream:` generator wraps each window in a `LiteBinaryReader` and
+yields decoded values. In `latest` mode `data()` is the most recent value, one signal
+write per frame, zero allocation.
+
+```js
+import { streamQuery } from '@zakkster/lite-query/stream';
+import { LiteBinaryReader, T_F64 } from '@zakkster/lite-binary-reader';
+
+const SCHEMA = [{ name: 'v', type: T_F64, offset: 0 }];
+
+const feed = streamQuery(qc, {
+  key: ['sensor', channel()],
+  mode: 'latest',
+  stream: async function* ({ signal }) {
+    const source = await openWindows(FEED_URL, { signal }); // your cancellable range/socket source
+    // THE ONE CONTRACT: wire the abort signal to cancel the in-flight read. An
+    // async generator parked on `await source.next()` cannot be released by
+    // streamQuery's iterator.return() until that await settles -- so on
+    // abort-on-detach you must cancel the source yourself, or it leaks.
+    signal.addEventListener('abort', () => source.cancel());
+
+    const sink = new Float64Array(SCHEMA.length);           // hoisted; reused every frame
+    for await (const win of source) {
+      if (signal.aborted) return;
+      const r = new LiteBinaryReader(win, { schema: SCHEMA, stride: 8, littleEndian: true }); // cold per window
+      const v = r.field('v');
+      for (let i = 0; i < r.count; i++) {
+        if (signal.aborted) return;
+        r.readRow(i, sink);        // zero-alloc into the reused sink
+        yield sink[0];             // one primitive per frame -- never a fresh record object
+      }
+    }
+  },
+});
+```
+
+Zero-GC frame path: the reader's per-frame work is `readRow` into a reused sink (0 B/op,
+gated by torture t6); the per-window `new LiteBinaryReader(...)` is a COLD allocation
+amortized across the window's rows; `streamQuery` latest mode adds one signal write per
+frame (its own zero-alloc contract). Yield a PRIMITIVE (or a reused out-param) -- a fresh
+`{ ... }` record per row would allocate on the hot path. Ownership: a decoded NUMBER is a
+value; a `bytes()` span is borrowed -- copy what you keep before the next window overwrites.
+
+Proven by: `test/coop-query.test.js` -- a real `streamQuery` decodes a foreign feed in
+order; detaching the last observer cancels the source (no value after abort); a reactive
+key change restarts the feed. lite-query is a test-only devDependency (no import edge).
+
+---
+
+## R7 (pro) -- read a lite-bake-stream shard INSIDE a `streamQuery`
+
+The same seam, but the windows are real `@zakkster/lite-bake-stream` shard payloads and
+each is read through `fromLBK1Shard` (R3) -- composing the S5 cooperation proof into a
+stream.
+
+```js
+import { streamQuery } from '@zakkster/lite-query/stream';
+import { Reader as StreamReader } from '@zakkster/lite-bake-stream/reader';
+import { LiteBinaryReader } from '@zakkster/lite-binary-reader';
+
+const container = StreamReader.fromBuffer(bytes);
+const feed = streamQuery(qc, {
+  key: ['lbk1', container.id],
+  mode: 'latest',
+  stream: async function* ({ signal }) {
+    const rowStride = container.strideBytes();
+    for (let s = 0; s < container.shardCount; s++) {
+      if (signal.aborted) return;
+      const lbr = LiteBinaryReader.fromLBK1Shard({
+        bytes: container.shardPayload(s),
+        rowStride,
+        fields: container.schema.fields,
+      });
+      const val = lbr.field('val');
+      for (let row = 0; row < lbr.count; row++) {
+        if (signal.aborted) return;
+        yield lbr.getF64(row, val);         // F64 cells, bit-exact vs bake-stream's own Reader
+      }
+    }
+  },
+});
+```
+
+Note the same ownership boundary as R3: an LBK1 U32 lane is a string-table INDEX; string
+resolution stays in bake-stream (`container.shardStringTable(s).get(index)`).
+
+Proven by: `test/coop-query.test.js` -- every row streamed through `fromLBK1Shard` is
+asserted bit-exact against `container.get(globalRow, 'val')`.
+
+---
+
 ## Where the boundaries are (so you do not reach for the wrong tool)
 
 - This reader is READ-ONLY: no write path, no schema mutation. To PRODUCE bytes, use

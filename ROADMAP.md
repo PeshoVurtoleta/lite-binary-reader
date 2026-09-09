@@ -682,3 +682,196 @@ from section 0: `@zakkster/lite-binary-reader` and the
 homepage/repository/bugs/funding URLs all resolve there (verified self-consistent
 offline; confirm live before publish). `/release 1.0.0`.
 ```
+
+===============================================================================
+# Post-1.0.0 -- feature roadmap (additive minors; each is its own session)
+===============================================================================
+These close genuine feature gaps vs top-tier binary readers (surfaced in the S7b
+review). They are DELIBERATELY held until after 1.0.0 so the current frozen contract
+(R_* union 10, type table 8, dts-drift floor) ships as the stable 1.0 baseline; each
+is then an ADDITIVE, backward-compatible minor. The existing 8 lanes and every read
+body stay byte-identical -- these ADD surface, they do not change what 1.0.0 shipped.
+Pre-1.0 hardening (S7b: schema-space fuzzer + bytes() negative gate + README-code
+subset check) lands before S8, not here.
+
+===============================================================================
+# S9 -- v1.1.0 -- 64-bit integer lanes (i64 / u64 via BigInt)  [HIGH VALUE]
+===============================================================================
+```markdown
+status: planned (post-1.0)
+depends_on: [S8]
+```
+PURPOSE
+  The one real feature a top-tier reader has that we do not: 64-bit integers. Real DB
+  rows and wire formats carry i64/u64; DataView reads them natively
+  (`getBigInt64`/`getBigUint64`). Add `T_I64` / `T_U64` type codes returning BigInt.
+TASKS
+  - Two new type codes; TYPE_BYTES gains two 8-byte entries. getBigInt64/getBigUint64
+    getters + `get`/cursor/readRow dispatch; laneOf eligibility via
+    BigInt64Array/BigUint64Array (host-endian + 8-aligned only, same rule as the rest).
+  - Reader.d.ts: the two codes, the two getters, the BigInt return type on the data-
+    driven paths (readRow into a BigInt64Array sink; number|bigint union documented).
+  - Coordinate with @zakkster/lite-bake's Types (does it mint i64/u64? read its
+    llms.txt -- do NOT assume). fromBaked/fromLBK1Shard translation extended if so.
+INVARIANT CHANGE (deliberate, gated): the dts-drift "type table exactly 8" assertion
+  becomes exactly 10; the R_* union is UNCHANGED at 10. This is the ONE place the
+  frozen type-table count moves, and it is an explicit, additive 1.1.0 decision -- the
+  drift gate is updated in lock-step, not bypassed. Torture gains i64/u64 fidelity +
+  0-B/op lane rows (BigInt reads box; the zero-alloc claim is scoped honestly -- a
+  BigInt result is not a primitive number, so getBigX allocates the BigInt; laneOf
+  over a BigInt64Array is the zero-alloc path for the hot 64-bit loop).
+DONE WHEN
+  i64/u64 read bit-exact vs a DataView oracle across LE/BE; laneOf serves the aligned
+  host-endian 64-bit lane; drift gate asserts table=10; CHANGELOG notes the additive
+  type-table change.
+
+===============================================================================
+# S10 -- v1.2.0 -- per-field endianness  [MEDIUM]
+===============================================================================
+```markdown
+status: planned (post-1.0)
+depends_on: [S8]
+```
+PURPOSE
+  Mixed-endian wire structs: today `littleEndian` is ONE per-reader flag. Allow an
+  optional per-field `littleEndian` on a schema field, defaulting to the reader flag
+  (so existing schemas are byte-identical).
+TASKS
+  - Optional `Field.littleEndian?`; the getter reads the field's endianness, falling
+    back to the reader's. laneOf eligibility becomes per-field (a field whose endian !=
+    host declines to null, as today). Reader.d.ts adds the optional field.
+  - The door validates it (boolean or absent); no new R_* code needed (reuse
+    R_BAD_SCHEMA for a non-boolean).
+DONE WHEN
+  a single reader reads an LE field and a BE field in the same row, both bit-exact;
+  laneOf declines the non-host field; default-absent path is byte-identical to 1.1.0.
+
+===============================================================================
+# S11 -- v1.3.0 -- type-level record inference in Reader.d.ts  [DX, zero runtime]
+===============================================================================
+```markdown
+status: planned (post-1.0)
+depends_on: [S3]
+```
+PURPOSE
+  Pure DX, ZERO runtime cost (types only -- fits the ethos). A `const`-typed schema
+  should infer a typed record so `get`/`readRow` are typed per field instead of
+  returning a bare `number`. Top TS readers (typed-struct, restructure) have this.
+TASKS
+  - Generic `LiteBinaryReader<S extends readonly Field[]>` inferring field name -> type
+    from the schema literal; typed `field(name)`, typed `readRow` sink. Runtime
+    unchanged -- Reader.js is byte-identical; this is a .d.ts-only enhancement.
+  - dts-drift extended to keep the generic surface honest.
+DONE WHEN
+  a `const` schema yields typed reads with no runtime change; the non-generic call
+  path still compiles (backward-compatible overload).
+
+===============================================================================
+# S12 -- v1.4.0 -- zero-alloc iterator sugar (+ optional string() hatch)  [DX]
+===============================================================================
+```markdown
+status: planned (post-1.0)
+depends_on: [S4]
+```
+PURPOSE
+  Modern looping ergonomics WITHOUT breaking the zero-GC contract:
+  `for (const row of reader) row.f32(id)`. Matches high-performance ECS iteration.
+TASKS
+  - `[Symbol.iterator]()` that advances the internal cursor (reusing seek/_cursor)
+    and yields the READER ITSELF as the row handle -- no per-row object. CRITICAL:
+    the iterator protocol allocates a `{ value, done }` result per step UNLESS you
+    return a SINGLE REUSED result object (mutated in place) -- so the "zero object
+    per iteration" claim holds ONLY with a reused result object, and it MUST be
+    torture-gated (a new t6 sub-case: 0 B/op across a full for-of pass) with a
+    LBR_TORTURE_BREAK-style control. A naive generator implementation FAILS this.
+  - Reader.d.ts: `[Symbol.iterator](): IterableIterator<this>` (or a typed row view).
+  - OPTIONAL, only if the maintainer decides the string boundary should MOVE (today
+    the docs say "string resolution stays with the producer"): a `string(row, id,
+    length?, decoder?)` escape hatch that takes an INJECTED TextDecoder (zero-dep
+    preserved) and decodes the field's span. It INHERENTLY allocates (a JS string is
+    a heap object), so it is a COLD hatch beside `bytes()`, documented as allocating
+    and EXCLUDED from the zero-alloc gate -- pairs with S7b's bytes() negative gate.
+    If the boundary stays, this is dropped and `bytes()` + caller-side decode remains
+    the contract.
+DONE WHEN
+  a full `for-of` pass is measured 0 B/op (reused result object, torture-gated with a
+  teeth control); if shipped, `string()` is documented as an allocating cold hatch and
+  the NOT-FOR/boundary docs are updated to match the decision.
+
+===============================================================================
+# S13 -- benchmark suite + headline numbers (vs similar modules)  [also a decision gate]
+===============================================================================
+```markdown
+status: planned (post-1.0)
+depends_on: [S8]
+```
+PURPOSE
+  Publishable, REPRODUCIBLE numbers that PROVE the module's reason to exist across its
+  four value axes -- not just ns/op:
+    1. FAST     -- ns/op vs a plain-DataView baseline and vs similar modules.
+    2. ZERO-GC  -- 0 B/op + 0 retained across every read surface (cite the torture
+                   gates: getX / cursor / readRow / laneOf, and the bytes() negative
+                   gate). The differentiator most peers cannot claim.
+    3. TINY     -- shipped bundle size (min+gz KB) and ZERO runtime dependencies, side
+                   by side with peers' install size + dep count.
+    4. SAVES TRAFFIC -- bytes-on-the-wire for N records as compact fixed-stride binary
+                   vs JSON (and the decode cost of each), showing the payload the reader
+                   makes cheap to consume. HONEST boundary: the bakers PRODUCE the
+                   bytes; this reader is what makes consuming them zero-copy/zero-GC --
+                   frame the traffic win as the reader+baker story, not the reader alone.
+  Also the DECISION GATE for the V8 endianness split-class idea (measure before
+  building; the suite's law is measured claims, never folklore).
+TASKS
+  - A ns/op harness on a FIXED fixture (pinned Node version + warmup + percentiles +
+    replay seed), covering: getX, the cursor reads, `laneOf` (the typed-array hot
+    path), `get`/`readRow`, and (after S9) the 64-bit lanes. Use the suite's
+    @zakkster/lite-perf-gate / lite-gc-profiler idiom; keep it ADVISORY (report), not
+    a hard CI fail (wall-clock is noisy) unless a stable >X% regression bound is set.
+  - BASELINE row: a hand-written plain-DataView loop -- the honest floor; show `laneOf`
+    at or near memory-bandwidth and getX vs the DataView baseline.
+  - THE V8 SPLIT-CLASS EXPERIMENT: build a throwaway LE/BE hardcoded-endianness getter
+    and measure it against the current dynamic-`_le` getter on the SAME fixture. If it
+    is a real, repeatable win on the FALLBACK (non-lane) path -> promote to a feature
+    session; if it is within noise (the modern-V8 expectation) -> record the negative
+    result and CLOSE the idea. Either way the decision is data, not opinion.
+  - COMPARATIVE numbers vs named similar modules WHERE THE COMPARISON IS FAIR (same
+    read-only, fixed-stride primitive workload): a plain DataView loop always; and,
+    with explicit CAVEATS about differing feature sets (read-only vs read+write,
+    schema DSL overhead), peers such as binary-parser / restructure / typed-struct.
+    Never cherry-pick; state the workload, the versions, and what is NOT comparable.
+  - Land the headline table in README (a new "Performance" section) and llms.txt, with
+    the fixture + command so anyone can reproduce it. Numbers with a repro, or they do
+    not ship.
+  BLUEPRINT -- copy ../LiteQuery/bench/bench.mjs, do NOT reinvent the harness:
+    - Location + script: `bench/bench.mjs`, `"bench": "node --expose-gc bench/bench.mjs"`.
+    - Methodology it pins (mirror exactly): WARMUP_RATIO ~0.05 (warm before timing),
+      `gc()` bracketing each timed loop, `process.hrtime.bigint()` timing, and per
+      scenario report BOTH ops/sec AND `transient/op` + `retained/op` bytes
+      (process.memoryUsage heapUsed delta) -- the bytes/op columns ARE the zero-GC
+      headline, so keep them; a peer that allocates per read loses on that axis alone.
+    - Report format: `> <scenario>` then a line per contender then
+      `lite is <N>x FASTER, allocates <N>x LESS transient`.
+    - README: a `## Performance` ops/sec table with an x-factor column + a top-of-file
+      headline blockquote citing the standout multipliers and linking to the section
+      (lite-query's exact shape).
+    - FAIRNESS discipline (the honest part): state the apples-to-apples baseline (for
+      us: a plain-DataView loop, always fair), same workload/fixture on every
+      contender, and -- like lite-query's "why no SWR" note -- explicitly say which
+      peers are EXCLUDED and why (e.g. write-only encoders, React-coupled, or a schema
+      DSL that measures a different thing). Never a comparison the reader would call rigged.
+DONE WHEN
+  a reproducible ns/op table exists (own surfaces + DataView baseline + fair peer
+  comparison), the V8 split-class question is answered with data (promote or close),
+  and the README/llms.txt carry the numbers WITH the repro command.
+
+===============================================================================
+# On demand (not scheduled -- only if a consumer needs them)
+===============================================================================
+- BITFIELDS / sub-byte lanes: real for flag/wire formats, but sub-byte masking adds
+  hot-path complexity; defer until a concrete consumer asks.
+- FLOAT16 (half-precision): GPU/ML data; DataView getFloat16 is newly/partially
+  available -- gate on engine support. Niche.
+INTENTIONAL BOUNDARIES (NOT gaps -- the package's scope, by design):
+- No write/encode path -- the bakers (lite-bake / lite-bake-stream) own writing.
+- No nested / array-of-struct DSL, no codegen -- lite-bake owns layout; this reads
+  flat fixed-stride bytes a producer already laid out.

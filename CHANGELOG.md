@@ -2,6 +2,45 @@
 
 All notable changes to `@zakkster/lite-binary-reader`.
 
+## 0.6.0
+
+A PROOF/EXAMPLE release: no runtime change. `Reader.js` moves only its `VERSION`
+const; every read body is byte-identical to 0.5.0. This release proves the reader
+drops into a real `@zakkster/lite-query` `streamQuery` `stream:` generator and
+decodes binary zero-GC, abort-clean, with no import edge.
+
+### Added
+- `test/coop-query.test.js`: the streaming-adapter proof. (a) A FOREIGN fixed-stride
+  feed wrapped per window in `LiteBinaryReader` inside a real `streamQuery` (latest
+  mode), yielding primitives (`readRow` into a hoisted reused sink), observed
+  in order; (b) a real `@zakkster/lite-bake-stream` shard read through
+  `fromLBK1Shard` inside the stream, F64 cells bit-exact vs bake-stream's own Reader.
+  Plus abort-on-detach (the generator cancels its in-flight source; no value after
+  abort), reactive-key restart, the structural zero-alloc frame path, and the D9
+  copy-what-you-keep ownership boundary.
+- `test/peer-surface.test.js`: a fail-closed guard asserting the lite-query symbols
+  this session consumes (`queryClient`, `streamQuery`, the handle shape) exist at
+  runtime -- nothing trusted from a peer's docs.
+- `test/helpers/query-observer.mjs` (repo-only helper): observes a lite-query handle
+  through the SAME lite-signal instance lite-query resolves (the peer-dedup topology
+  a published consumer has), plus the foreign-window + cancellable-source utilities.
+- `examples/streamQuery-adapter.md` (repo-only, not shipped): the runnable adapter.
+- `Cookbook.md`: recipes R6 (stream a foreign feed) and R7 (`fromLBK1Shard` inside a
+  streamQuery), each citing its passing test.
+- `decisions/0007-lite-query-adapter.md`: the recipe scope, the zero-alloc boundary,
+  the signal-cancel contract, the D9 ownership boundary, and the temporary devDeps.
+
+### Changed
+- Test count 81 -> 90 (the streaming-adapter and peer-surface suites above).
+- `VERSION` 0.5.0 -> 0.6.0 (`Reader.js`, `package.json`, `llms.txt`).
+- `@zakkster/lite-query` (plus its `@zakkster/lite-signal` / `@zakkster/lite-stream`
+  peers) added as TEST-only `file:` devDependencies; consumed by the test only,
+  excluded from the published tarball. These devDeps are temporary and are to be
+  reconsidered at the S8 v1.0.0 gate (decisions/0007).
+- The torture harness is unchanged and stays sibling-free: the reader's per-frame
+  contribution (`readRow` into a reused sink) is already gated at 0 B/op by torture
+  t6; the streaming proof lives only in `npm test`.
+
 ## 0.5.0
 
 A PROOF release: no runtime change. `Reader.js` moves only its `VERSION` const; the

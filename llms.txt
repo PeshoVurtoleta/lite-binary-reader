@@ -7,7 +7,7 @@ fields with NO allocation, at ANY byte offset, with EXPLICIT endianness. Reads
 through a DataView, so a field may sit at an odd (unaligned) offset a typed-array
 lane cannot address. Single-file ESM, zero runtime dependencies, node:test only.
 
-## Status: 0.5.0 - S5: cooperation proof vs real lite-bake / lite-bake-stream
+## Status: 0.6.0 - S6: lite-query streaming adapter (proven, not imported)
 
 S0 landed the reader and the sibling constructors. S1 hardened the construction
 door (BR-01..BR-04). S2 closed the view-window and sibling-shape holes
@@ -63,7 +63,7 @@ core (getF64..getU8/get/bytes/seek+f64..u8/val/readRow) stays byte-identical to
 new code of either kind is minted, and the lane surface carries its own differential
 and 0-B/op gates (decisions/0005):
 
-S5 (this release, 0.5.0) is a PROOF release -- no runtime change (Reader.js moves
+S5 (0.5.0) was a PROOF release -- no runtime change (Reader.js moved
 only its VERSION const). It proves the cold cooperation constructors read the REAL
 sibling output, not emulated bytes: `fromBaked` vs @zakkster/lite-bake's own Reader
 cell-for-cell across all 8 lanes, and `fromLBK1Shard` vs @zakkster/lite-bake-stream's
@@ -71,6 +71,22 @@ own Reader (F64 bit-exact; a U32 lane is a string-table INDEX, resolution stays 
 bake-stream). The D3 wire-code translation (LBK1 wire U32=3 -> our T_U32=5) is proven
 by a no-translate control that MUST diverge. The siblings are file: devDependencies
 of the TEST only -- no import edge (asserted). decisions/0006 records it.
+
+S6 (this release, 0.6.0) is also a PROOF/EXAMPLE release -- Reader.js moves only its
+VERSION const. It proves the reader drops into a real @zakkster/lite-query
+`streamQuery` `stream:` generator and decodes binary zero-GC, abort-clean, with NO
+import edge (lite-query is a TEST-only devDependency). Two recipes: (a) a streamed
+FOREIGN fixed-stride feed -- bytes no baker wrote -- wrapped per window in a
+LiteBinaryReader and yielded as primitives (readRow into a hoisted reused sink); and
+(b) a real @zakkster/lite-bake-stream shard read through `fromLBK1Shard` INSIDE a
+streamQuery. The frame path is 0 B/op (the reader's per-frame contribution is
+readRow-into-a-reused-sink, gated by torture t6; the per-window reader construction is
+cold/amortized; streamQuery latest mode is lite-query's own one-write-per-frame
+contract). The lesson the proof encodes: the `stream:` generator MUST wire the abort
+`signal` to cancel its in-flight source read, or an async generator parked on an await
+cannot be released on abort-on-detach. Ownership (D9): a decoded NUMBER is a value
+(safe); a `bytes()` span is borrowed -- copy what you keep before the next frame
+overwrites the window. decisions/0007 records it.
 
 - `laneOf(fieldId)` -> a frozen `{ view, elemStride, elemOffset }` for a
   lane-ELIGIBLE field, or `null`. Called ONCE outside the loop like `field()`; the
@@ -165,11 +181,11 @@ carries a coded `R_*` tag on `error.code`:
                     bytes() span reads past the buffer
 - R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
 
-## API (0.5.0)
+## API (0.6.0)
 
 Named exports from `@zakkster/lite-binary-reader`:
 
-- VERSION: '0.5.0'
+- VERSION: '0.6.0'
 - IS_LITTLE_ENDIAN: boolean (host byte order, detected once)
 - T_F32=0, T_F64=1, T_I32=2, T_I16=3, T_I8=4, T_U32=5, T_U16=6, T_U8=7
 - LiteBinaryReaderError: Error subclass; `.code` carries the R_* tag
@@ -275,8 +291,9 @@ allocation and the gate rejects it (a gate that cannot fail is decorative).
 
 ## Testing
 
-- npm test        -- 81 node:test cases (contract + boundary + drift + cooperation
-  proof: coop-bake / coop-lbk1 / coop-multireader / coop-join + no-import-edge)
+- npm test        -- 90 node:test cases (contract + boundary + drift + cooperation
+  proof: coop-bake / coop-lbk1 / coop-multireader / coop-join + no-import-edge; S6
+  streaming adapter: coop-query + peer-surface)
 - npm run torture -- @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints `ok`
 - npm run torture:controls -- the door/coherence controls
 - npm run verify  -- test + torture + controls, the publish gate
@@ -295,6 +312,11 @@ allocation and the gate rejects it (a gate that cannot fail is decorative).
   (different schemas joined by key is a recipe, never a shipped API). See Cookbook.md.
 - Any raw/foreign source: a wire frame, an mmap'd struct, WASM linear memory, an
   SoA column dump -- pass the ArrayBuffer (or view) with an explicit layout.
+- @zakkster/lite-query: feed a `streamQuery` `stream:` generator zero-GC binary
+  reads. PROVEN (S6): a FOREIGN feed decoded per window through LiteBinaryReader,
+  and a bake-stream shard read through `fromLBK1Shard`, both inside a real
+  streamQuery -- abort-clean on detach, 0 B/op frame path, no import edge
+  (lite-query is a test-only devDependency). See Cookbook.md and examples/.
 
 ## License
 

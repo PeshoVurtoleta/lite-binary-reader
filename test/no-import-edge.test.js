@@ -6,7 +6,10 @@
  * `import ... from "@zakkster/..."` in Reader.js (or Reader.d.ts) would be a
  * suite-law violation and a hidden runtime-dep edge. This encodes that as a
  * gate: read the shipped source TEXT and assert ZERO sibling import specifiers,
- * with a positive control proving the regex can actually match.
+ * with a positive control proving the regex can actually match. The generic
+ * `@zakkster` specifier match covers every test-only devDependency -- the S5
+ * bakers (lite-bake / lite-bake-stream) and the S6 streaming peers
+ * (lite-query / lite-signal / lite-stream) alike.
  */
 
 import { test } from "node:test";
