@@ -22,6 +22,11 @@
  * the correctly-translated U32 value -- the test FAILS if they agree (teeth).
  */
 
+// VERSION PIN: this proof was verified against @zakkster/lite-bake-stream ^1.7.1
+// (the devDependency floor in package.json). The LBK1 wire lane_kind -> our type
+// code map and the shard-carve contract (shardPayload / strideBytes / schema.fields,
+// payload_len === rowCount*rowStride) are bake-stream's to state -- a major bump is a
+// CONSCIOUS re-verify against its llms.txt, never a silent drift.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { serialize } from "@zakkster/lite-bake-stream";

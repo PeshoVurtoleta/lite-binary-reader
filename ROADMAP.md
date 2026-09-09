@@ -669,6 +669,51 @@ with S2's fixes under a "Fixed" section naming BR-01..BR-06. ASCII-only; grep fo
 stray tool-call tags in every new file. Add README + llms.txt to `files[]`.
 
 ===============================================================================
+# S7c -- demos: one standalone + one compound (ecosystem standard)
+===============================================================================
+```markdown
+status: planned
+depends_on: [S6]   (compound uses the S5/S6 file: devDeps already present)
+```
+PURPOSE
+  Every A-tier sibling ships a demo (lite-query + lite-bake-stream have served
+  browser demos; lite-bake ships a node example). This reader has none. Add two,
+  REPO-ONLY (demo/ is already asserted ABSENT from the tarball by the release skill).
+  Reuse the file: devDeps already installed (lite-bake, lite-query) -- no new deps.
+  BLUEPRINT: copy a sibling's demo shape -- `demo/` dir + a `"demo"` npm script
+  (lite-bake-stream: `"demo": "npx serve ."`; lite-bake: `"example": "node
+  examples/basic.js"`). This module is HEADLESS/data like lite-bake, so runnable node
+  scripts are the core; a served browser visual is an OPTIONAL stretch (below).
+TASKS
+  - `demo/standalone.mjs` + `"demo": "node demo/standalone.mjs"`: the reader ALONE --
+    the foreign-bytes headline. Build a packed buffer with an UNALIGNED field and
+    BIG-ENDIAN order (the two things a typed-array lane / lite-bake cannot do), read it
+    zero-GC, show `field()` resolved once + a getX loop + the `laneOf` fast path on an
+    aligned host-endian column. Print a before/after that makes "reads bytes nobody
+    else can, allocating nothing" concrete. ASCII-only, no deps.
+  - `demo/compound.mjs`: the ECOSYSTEM pipeline the reader lives in -- the real
+    query-builder scenario. lite-bake bakes a PARENT table (orders) and a CHILDREN
+    table (line items) separately -> one LiteBinaryReader per table via `fromBaked`
+    -> join parent->children by key in caller code (the R5 Cookbook flagship) ->
+    OPTIONALLY feed the rows through a lite-query `streamQuery` (the S6 adapter) so the
+    demo shows bake -> read -> reactive-stream end to end. Uses the file: devDeps; keep
+    it deterministic (no timers/network, drive the stream directly per the S6 helper).
+  - README: a short "Demos" section pointing at both with the run commands. Do NOT add
+    demo/ to files[] (stays repo-only; pack still 7 files).
+  DECISION (for the maintainer): ALSO ship a served BROWSER visual demo
+  (`demo/index.html` + `"demo": "npx serve ."`, matching lite-query / lite-bake-stream)
+  that decodes a packed binary telemetry/particle feed and RENDERS it live -- making
+  the zero-GC + traffic-saving story visual? Recommend: node scripts first (this is a
+  data module), add the browser visual only if you want the parity with the visual
+  siblings; it is a bigger surface (a tiny canvas/table renderer) with no new runtime dep.
+DONE WHEN
+  `npm run demo` runs the standalone; `node demo/compound.mjs` runs the pipeline; both
+  are deterministic, ASCII-clean, dep-free at runtime (file: devDeps for the compound),
+  and README links them. demo/ stays out of the tarball (pack still 7 files).
+NOTE: repo-only, no runtime change -- folds into the S7 docs release (or a 0.6.x patch);
+  Reader.js stays byte-identical.
+
+===============================================================================
 # S8 -- v1.0.0 -- release gate
 ===============================================================================
 ```markdown

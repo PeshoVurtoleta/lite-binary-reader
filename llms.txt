@@ -7,7 +7,7 @@ fields with NO allocation, at ANY byte offset, with EXPLICIT endianness. Reads
 through a DataView, so a field may sit at an odd (unaligned) offset a typed-array
 lane cannot address. Single-file ESM, zero runtime dependencies, node:test only.
 
-## Status: 0.6.0 - S6: lite-query streaming adapter (proven, not imported)
+## Status: 0.6.1 - S7b: pre-1.0 hardening (schema-space fuzz + gates)
 
 S0 landed the reader and the sibling constructors. S1 hardened the construction
 door (BR-01..BR-04). S2 closed the view-window and sibling-shape holes
@@ -72,7 +72,7 @@ bake-stream). The D3 wire-code translation (LBK1 wire U32=3 -> our T_U32=5) is p
 by a no-translate control that MUST diverge. The siblings are file: devDependencies
 of the TEST only -- no import edge (asserted). decisions/0006 records it.
 
-S6 (this release, 0.6.0) is also a PROOF/EXAMPLE release -- Reader.js moves only its
+S6 (0.6.0) was also a PROOF/EXAMPLE release -- Reader.js moved only its
 VERSION const. It proves the reader drops into a real @zakkster/lite-query
 `streamQuery` `stream:` generator and decodes binary zero-GC, abort-clean, with NO
 import edge (lite-query is a TEST-only devDependency). Two recipes: (a) a streamed
@@ -181,11 +181,11 @@ carries a coded `R_*` tag on `error.code`:
                     bytes() span reads past the buffer
 - R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
 
-## API (0.6.0)
+## API (0.6.1)
 
 Named exports from `@zakkster/lite-binary-reader`:
 
-- VERSION: '0.6.0'
+- VERSION: '0.6.1'
 - IS_LITTLE_ENDIAN: boolean (host byte order, detected once)
 - T_F32=0, T_F64=1, T_I32=2, T_I16=3, T_I8=4, T_U32=5, T_U16=6, T_U8=7
 - LiteBinaryReaderError: Error subclass; `.code` carries the R_* tag
@@ -291,10 +291,13 @@ allocation and the gate rejects it (a gate that cannot fail is decorative).
 
 ## Testing
 
-- npm test        -- 90 node:test cases (contract + boundary + drift + cooperation
+- npm test        -- 96 node:test cases (contract + boundary + drift + cooperation
   proof: coop-bake / coop-lbk1 / coop-multireader / coop-join + no-import-edge; S6
-  streaming adapter: coop-query + peer-surface)
-- npm run torture -- @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints `ok`
+  streaming adapter: coop-query + peer-surface; S7b: bytes() cold-path gate +
+  README-code subset gate)
+- npm run torture -- @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints `ok`;
+  tiers t0/t1/t2/t5/t6/t7/t9 plus t8 schema-space fuzz (thousands of RANDOM legal
+  schemas vs a DataView oracle, seed-replayable)
 - npm run torture:controls -- the door/coherence controls
 - npm run verify  -- test + torture + controls, the publish gate
 
@@ -317,6 +320,13 @@ allocation and the gate rejects it (a gate that cannot fail is decorative).
   and a bake-stream shard read through `fromLBK1Shard`, both inside a real
   streamQuery -- abort-clean on detach, 0 B/op frame path, no import edge
   (lite-query is a test-only devDependency). See Cookbook.md and examples/.
+
+## Boundary: concurrency
+
+Reads over a SharedArrayBuffer like any DataView, but provides NO atomics and no
+synchronization -- it is NOT a concurrency primitive. Cross-worker reads while
+another thread writes are the caller's to coordinate (Atomics on your own SAB). No
+thread-safety is implied or tested.
 
 ## License
 

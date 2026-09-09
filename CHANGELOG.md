@@ -2,6 +2,37 @@
 
 All notable changes to `@zakkster/lite-binary-reader`.
 
+## 0.6.1
+
+A hardening pass: no runtime change. `Reader.js` moves only its `VERSION` const;
+every read body is byte-identical to 0.6.0. Adds a schema-space fuzzer and two
+negative/doc-drift gates, all pre-1.0 belt-and-braces.
+
+### Added
+- Torture tier `t8` (schema-space fuzz): thousands of RANDOM legal schemas -- random
+  field count, a random subset/order of the 8 type codes, random inter-field padding
+  (arbitrary, often unaligned offsets), random stride tail pad, LE or BE -- read
+  cell-for-cell (`Object.is`) against a `DataView` oracle built from the same layout.
+  Seed-replayable (`TORTURE_SEED`), non-vacuous (all 8 lanes + both endiannesses),
+  with a deliberate wrong-offset teeth control. Exercises the layout arithmetic the
+  fixed-schema tiers cannot.
+- `test/bytes-alloc-boundary.test.js`: a negative gate pinning that `bytes()` mints a
+  FRESH view per call -- it stays a cold-path allocator and cannot be silently pooled
+  into the zero-GC hot path (which would let it ship under a false zero-alloc claim).
+- `test/readme-codes.test.js`: asserts every `R_*` code the README names is one
+  `Reader.js` actually throws (subset check), with the thrown union pinned at 10 and a
+  positive control. Complements the `.d.ts` drift guard.
+
+### Changed
+- Test count 90 -> 96 (the two gates above); torture gains tier `t8`.
+- `VERSION` 0.6.0 -> 0.6.1 (`Reader.js`, `package.json`, `llms.txt`).
+- `test/coop-lbk1.test.js`: a version-pin comment recording the
+  `@zakkster/lite-bake-stream` floor the LBK1 proof was verified against, so a major
+  bump is a conscious re-verify rather than a silent drift.
+- Docs: a "not a concurrency primitive" boundary note (README + llms.txt) -- reads over
+  a `SharedArrayBuffer` like any `DataView`, but provides no atomics; cross-worker
+  synchronization is the caller's.
+
 ## 0.6.0
 
 A PROOF/EXAMPLE release: no runtime change. `Reader.js` moves only its `VERSION`

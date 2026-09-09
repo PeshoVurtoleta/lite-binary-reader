@@ -13,6 +13,7 @@
  *     t0  read-fidelity laws            t1  degenerate layouts
  *     t2  adversarial + door matrix     t5  differential vs oracles
  *     t6  zero-alloc + retained-alloc   t7  soak + lite-leak witness
+ *     t8  schema-space fuzz vs DataView oracle
  *     t9  controls (every gate must be able to fail)
  *
  * lite-gc-profiler is one-measurement-at-a-time and throws "already in flight"
@@ -62,6 +63,7 @@ async function main() {
   const { run: t5 } = await import('./torture/t5-differential.mjs');
   const { run: t6 } = await import('./torture/t6-alloc.mjs');
   const { run: t7 } = await import('./torture/t7-soak.mjs');
+  const { run: t8 } = await import('./torture/t8-schema-fuzz.mjs');
   const { run: t9 } = await import('./torture/t9-controls.mjs');
 
   const TIERS = [
@@ -71,6 +73,7 @@ async function main() {
     ['t5 differential', t5],
     ['t6 alloc', t6],
     ['t7 soak', t7],
+    ['t8 schema-fuzz', t8],
     ['t9 controls', t9],
   ];
 
