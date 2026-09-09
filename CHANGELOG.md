@@ -2,6 +2,44 @@
 
 All notable changes to `@zakkster/lite-binary-reader`.
 
+## 0.5.0
+
+A PROOF release: no runtime change. `Reader.js` moves only its `VERSION` const; the
+cold cooperation constructors (`fromBaked`, `fromLBK1Shard`) and every read body are
+byte-identical to 0.4.0. This release proves those constructors against the siblings'
+REAL output instead of emulated bytes.
+
+### Added
+- `test/coop-bake.test.js`: `fromBaked` reads `@zakkster/lite-bake`'s real baked
+  output cell-for-cell against lite-bake's own `Reader`, across all 8 lanes. Offsets
+  and stride are read from lite-bake's reported layout, never recomputed.
+- `test/coop-lbk1.test.js`: `fromLBK1Shard` reads a real `@zakkster/lite-bake-stream`
+  shard -- F64 cells bit-exact (`Object.is`), a U32 lane read as the raw string-table
+  INDEX (string resolution stays in bake-stream, by contract). Includes the D3
+  no-translate CONTROL: reading the LBK1 U32 lane without the wire-to-ours code
+  translation (wire 3 read raw as our T_I16) must diverge -- teeth on the translation.
+- `test/coop-multireader.test.js`: a test-only `ShardUnion` mapping a global row to
+  (shard, localRow) over same-schema shards, matched against bake-stream's own reader.
+- `test/coop-join.test.js`: a query-builder PARENT + CHILDREN result -- each table
+  baked separately, one `LiteBinaryReader` per table, joined parent-to-children by key
+  in caller code (different schemas joined by key is a recipe, not a shipped API).
+- `test/no-import-edge.test.js`: asserts `Reader.js` and `Reader.d.ts` import no
+  sibling (`from "@zakkster/..."`) -- the D10 no-import-edge law, enforced not claimed.
+- `test/mock/fixtures.js`: named flat fixtures (single-lane, all-8-lane, nested-then-
+  flattened, NaN/+/-Infinity/-0 on F64, a real-data sample) driving both coop paths.
+- `Cookbook.md` (repo-only, not shipped): five recipes beginner to pro, each citing
+  its passing test; the flagship is the parent/children multi-reader join.
+- `decisions/0006-cooperation-proof.md`: the rulings, the D3 wire-code map, the
+  U32-is-a-string-index ownership boundary, and the `payload_len`/count risk + guard.
+
+### Changed
+- Test count 73 -> 81 (the cooperation-proof suites above).
+- `VERSION` 0.4.0 -> 0.5.0 (`Reader.js`, `package.json`, `llms.txt`).
+- `@zakkster/lite-bake` and `@zakkster/lite-bake-stream` added as `file:`
+  devDependencies -- consumed by the TEST only; excluded from the published tarball.
+- The torture harness is unchanged and stays sibling-free: `node --expose-gc
+  test/torture.mjs` still runs standalone with its emulated oracles.
+
 ## 0.4.0
 
 ### Added

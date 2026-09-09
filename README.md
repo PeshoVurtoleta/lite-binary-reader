@@ -306,7 +306,7 @@ Both validate the argument SHAPE before any dereference, so a null or malformed 
 | `T_U16`  | 6     | `getUint16`   | 2             |
 | `T_U8`   | 7     | `getUint8`    | 1             |
 
-Byte-for-byte `@zakkster/lite-bake`'s `Types` table, so a `lite-bake` schema drops into this reader unchanged. `IS_LITTLE_ENDIAN` (the host byte order, detected once) and `VERSION` (`'0.4.0'`) are also exported.
+Byte-for-byte `@zakkster/lite-bake`'s `Types` table, so a `lite-bake` schema drops into this reader unchanged. `IS_LITTLE_ENDIAN` (the host byte order, detected once) and `VERSION` (`'0.5.0'`) are also exported.
 
 ### Error codes
 
@@ -355,6 +355,8 @@ const fromWire = new LiteBinaryReader(socketBuffer, {
 
 Every stage passes a flat `ArrayBuffer` and reads numbers out -- no format translation, no allocation between stages, and (via the shared type table) no schema rewriting to move a `lite-bake` layout into this reader.
 
+As of 0.5.0 this cooperation is PROVEN against the siblings' REAL output, not emulated bytes: `fromBaked` reads `@zakkster/lite-bake`'s baked buffer cell-for-cell against lite-bake's own `Reader` across all 8 lanes, and `fromLBK1Shard` reads a real `@zakkster/lite-bake-stream` shard with F64 cells bit-exact and the LBK1 wire lane codes translated to ours (a no-translate control is asserted to diverge). The siblings are `file:` devDependencies of the TEST only -- there is no import edge, asserted by a test. A real query-builder shape -- a PARENT table with CHILDREN outputs -- bakes each table separately, opens one reader per table, and joins parent to children by key in caller code; because that joins different schemas by key it stays a recipe, never a shipped API. See `Cookbook.md`.
+
 ---
 
 ## Zero-GC design notes
@@ -401,16 +403,16 @@ The one cold branch is the throw path: a coded error is built (and its message c
 
 ## Testing
 
-**73 deterministic tests, all pass**, plus a torture gate that proves leak-freedom and a controls run that proves the door.
+**81 deterministic tests, all pass**, plus a torture gate that proves leak-freedom and a controls run that proves the door.
 
 ```bash
-npm test                 # 73 node:test cases (contract + boundary + drift guard)
+npm test                 # 81 node:test cases (contract + boundary + drift guard + cooperation proof)
 npm run torture          # @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints "ok"
 npm run torture:controls # the door + coherence controls (every gate can fail)
 npm run verify           # test + torture + controls, the publish gate
 ```
 
-The suites cover: read fidelity across every type code and both endiannesses; the full fail-closed construction door (every `R_*` path, including detached-buffer BR-08/BR-09, the unaligned-offset read, the derived-vs-explicit stride and count, and the partial-view copy BR-07); the `bytes()` escape hatch and its bounds; the sibling constructors against malformed input; the cursor, `readRow`, and variable-length surfaces (cursor-vs-`getX` parity, the `readRow` door and its reentrancy, and variable-length spans at nonzero-base and partial-view sources); the typed-lane fast path (`laneOf` eligibility and its decline contract on unaligned, odd-stride, opposite-endian, and out-of-range fields, plus lane-vs-`getX` parity including a BR-07 partial-window source); and the `.d.ts` drift guard (code-union, export, and version parity, with mutation controls). The torture harness runs read-fidelity, degenerate-layout, an adversarial source-x-count-x-offset door matrix asserting throws-iff-incoherent across every source kind (including detached and `DataView`), a cursor-vs-`getX` differential, a lane-vs-`getX` differential across the alignment-x-endianness-x-type matrix (with a stride-mutation control for teeth), per-surface zero-alloc and retained-alloc gates, and a soak witness. `LBR_TORTURE_BREAK=1` injects a retained allocation to prove the gate can fail; no gate output is a FAIL.
+The suites cover: read fidelity across every type code and both endiannesses; the full fail-closed construction door (every `R_*` path, including detached-buffer BR-08/BR-09, the unaligned-offset read, the derived-vs-explicit stride and count, and the partial-view copy BR-07); the `bytes()` escape hatch and its bounds; the sibling constructors against malformed input; the cursor, `readRow`, and variable-length surfaces (cursor-vs-`getX` parity, the `readRow` door and its reentrancy, and variable-length spans at nonzero-base and partial-view sources); the typed-lane fast path (`laneOf` eligibility and its decline contract on unaligned, odd-stride, opposite-endian, and out-of-range fields, plus lane-vs-`getX` parity including a BR-07 partial-window source); and the `.d.ts` drift guard (code-union, export, and version parity, with mutation controls). The torture harness runs read-fidelity, degenerate-layout, an adversarial source-x-count-x-offset door matrix asserting throws-iff-incoherent across every source kind (including detached and `DataView`), a cursor-vs-`getX` differential, a lane-vs-`getX` differential across the alignment-x-endianness-x-type matrix (with a stride-mutation control for teeth), per-surface zero-alloc and retained-alloc gates, and a soak witness. `LBR_TORTURE_BREAK=1` injects a retained allocation to prove the gate can fail; no gate output is a FAIL. The cooperation proof (0.5.0) adds node:test suites that read the siblings' REAL output -- `fromBaked` cell-for-cell vs `@zakkster/lite-bake`'s own Reader over mock fixtures spanning all 8 lanes plus NaN/+/-Infinity/-0, `fromLBK1Shard` vs `@zakkster/lite-bake-stream` (F64 bit-exact, U32 as a string-table index, a no-translate control asserted to diverge), a same-schema shard union, a parent/children multi-reader join, and an assertion that `Reader.js` imports no sibling (the siblings are `file:` devDependencies of the test only).
 
 ---
 

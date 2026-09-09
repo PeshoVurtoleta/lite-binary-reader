@@ -581,10 +581,10 @@ NON-GOALS: no write path; no schema mutation; no per-read bounds checks on getX.
 Each new surface gets its own T6 zero-alloc + retained-alloc gate.
 
 ===============================================================================
-# S5 -- v0.4.0 -- cooperation proof: lite-bake / lite-bake-stream
+# S5 -- v0.5.0 -- cooperation proof: lite-bake / lite-bake-stream
 ===============================================================================
 ```markdown
-version_target: 0.4.0
+version_target: 0.5.0
 status: planned
 depends_on: [S2]
 peers_optional: ["@zakkster/lite-bake", "@zakkster/lite-bake-stream"]
@@ -616,10 +616,10 @@ DONE WHEN
   edge; the translation control fails.
 
 ===============================================================================
-# S6 -- v0.5.0 -- lite-query streaming adapter (cookbook, not an import)
+# S6 -- v0.6.0 -- lite-query streaming adapter (cookbook, not an import)
 ===============================================================================
 ```markdown
-version_target: 0.5.0
+version_target: 0.6.0
 status: planned
 depends_on: [S5]
 peers_optional: ["@zakkster/lite-query"]

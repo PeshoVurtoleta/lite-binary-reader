@@ -7,7 +7,7 @@ fields with NO allocation, at ANY byte offset, with EXPLICIT endianness. Reads
 through a DataView, so a field may sit at an odd (unaligned) offset a typed-array
 lane cannot address. Single-file ESM, zero runtime dependencies, node:test only.
 
-## Status: 0.4.0 - S4b: native typed-lane fast path (laneOf)
+## Status: 0.5.0 - S5: cooperation proof vs real lite-bake / lite-bake-stream
 
 S0 landed the reader and the sibling constructors. S1 hardened the construction
 door (BR-01..BR-04). S2 closed the view-window and sibling-shape holes
@@ -56,12 +56,21 @@ gate (decisions/0004):
   numeric field plus a `lengthField` pointer. The 3-arg `bytes(row,id,len)` is
   unchanged.
 
-S4b (this release, 0.4.0) adds ONE additive read surface -- a native typed-array
+S4b (0.4.0) added ONE additive read surface -- a native typed-array
 lane offered ALONGSIDE getX for the absolute hot loop over one column. The pinned
 core (getF64..getU8/get/bytes/seek+f64..u8/val/readRow) stays byte-identical to
 0.3.0, the R_* union stays exactly 10, the type table exactly 8 (both gated), no
 new code of either kind is minted, and the lane surface carries its own differential
 and 0-B/op gates (decisions/0005):
+
+S5 (this release, 0.5.0) is a PROOF release -- no runtime change (Reader.js moves
+only its VERSION const). It proves the cold cooperation constructors read the REAL
+sibling output, not emulated bytes: `fromBaked` vs @zakkster/lite-bake's own Reader
+cell-for-cell across all 8 lanes, and `fromLBK1Shard` vs @zakkster/lite-bake-stream's
+own Reader (F64 bit-exact; a U32 lane is a string-table INDEX, resolution stays in
+bake-stream). The D3 wire-code translation (LBK1 wire U32=3 -> our T_U32=5) is proven
+by a no-translate control that MUST diverge. The siblings are file: devDependencies
+of the TEST only -- no import edge (asserted). decisions/0006 records it.
 
 - `laneOf(fieldId)` -> a frozen `{ view, elemStride, elemOffset }` for a
   lane-ELIGIBLE field, or `null`. Called ONCE outside the loop like `field()`; the
@@ -156,11 +165,11 @@ carries a coded `R_*` tag on `error.code`:
                     bytes() span reads past the buffer
 - R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
 
-## API (0.4.0)
+## API (0.5.0)
 
 Named exports from `@zakkster/lite-binary-reader`:
 
-- VERSION: '0.4.0'
+- VERSION: '0.5.0'
 - IS_LITTLE_ENDIAN: boolean (host byte order, detected once)
 - T_F32=0, T_F64=1, T_I32=2, T_I16=3, T_I8=4, T_U32=5, T_U16=6, T_U8=7
 - LiteBinaryReaderError: Error subclass; `.code` carries the R_* tag
@@ -266,7 +275,8 @@ allocation and the gate rejects it (a gate that cannot fail is decorative).
 
 ## Testing
 
-- npm test        -- 73 node:test cases (contract + boundary + drift)
+- npm test        -- 81 node:test cases (contract + boundary + drift + cooperation
+  proof: coop-bake / coop-lbk1 / coop-multireader / coop-join + no-import-edge)
 - npm run torture -- @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints `ok`
 - npm run torture:controls -- the door/coherence controls
 - npm run verify  -- test + torture + controls, the publish gate
@@ -275,7 +285,14 @@ allocation and the gate rejects it (a gate that cannot fail is decorative).
 
 - @zakkster/lite-bake: read its baked `{ buffer, stride, count, schema }` output
   with `fromBaked` -- the type table is shared, so the schema drops in unchanged.
+  PROVEN (S5): reads lite-bake's real output cell-for-cell vs its own Reader.
 - @zakkster/lite-bake-stream: read one carved LBK1 shard with `fromLBK1Shard`.
+  PROVEN (S5): F64 cells bit-exact vs bake-stream's own Reader; a U32 lane is a
+  string-table INDEX (string RESOLUTION stays in bake-stream, by contract -- the
+  reader returns the index). The LBK1 wire lane codes are TRANSLATED to ours.
+- Multiple readers, one per table: a query-builder PARENT + CHILDREN result bakes
+  each table separately, opens one reader each, and joins by key in CALLER code
+  (different schemas joined by key is a recipe, never a shipped API). See Cookbook.md.
 - Any raw/foreign source: a wire frame, an mmap'd struct, WASM linear memory, an
   SoA column dump -- pass the ArrayBuffer (or view) with an explicit layout.
 
