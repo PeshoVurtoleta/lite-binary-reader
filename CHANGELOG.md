@@ -2,6 +2,35 @@
 
 All notable changes to `@zakkster/lite-binary-reader`.
 
+## 1.0.0
+
+Stable release. No runtime change: `Reader.js` is byte-identical to 0.7.0 (only its
+`VERSION` const moves, 0.7.0 -> 1.0.0). This version declares the public contract
+stable -- breaking any of the frozen items below is a 2.0.0.
+
+### Frozen (the 1.0.0 contract)
+- The `R_*` error-code union is exactly **10**: `R_BAD_COUNT`, `R_BAD_LENGTH`,
+  `R_BAD_OFFSET`, `R_BAD_SCHEMA`, `R_BAD_SOURCE`, `R_BAD_STRIDE`, `R_BAD_TYPE`,
+  `R_BUFFER_TOO_SMALL`, `R_DUPLICATE_FIELD`, `R_UNKNOWN_FIELD`.
+- The type-code table is exactly **8** (codes 0-7): `T_F32`, `T_F64`, `T_I32`,
+  `T_I16`, `T_I8`, `T_U32`, `T_U16`, `T_U8`.
+- The read surface is stable: `getF64`..`getU8` / `get`, `seek` + the cursor reads /
+  `val`, `readRow`, `laneOf`, `bytes` (both overloads), `field` / `typeOf` /
+  `offsetOf`, and the `fromBaked` / `fromLBK1Shard` cold constructors.
+- All three inventories (code union, type table, version) are gated by
+  `test/dts-drift.test.js` against `Reader.js`, `Reader.d.ts`, and `package.json`.
+
+### Changed
+- `package.json`, `Reader.js` `VERSION`, `llms.txt` (status + API header + `VERSION`
+  literal), and the `test/Reader.test.js` version assertion synced to 1.0.0.
+- Package status: building -> stable.
+
+### Deferred (additive, post-1.0 -- do not change what 1.0.0 shipped)
+- S9 (1.1.0) 64-bit integer lanes (i64/u64 via BigInt) -- the one place the type
+  table moves (8 -> 10), in lock-step with the drift gate. S10 (1.2.0) per-field
+  endianness. S11 (1.3.0) `.d.ts` record inference (types only). S12 (1.4.0)
+  zero-alloc iterator sugar. See `ROADMAP.md` and `decisions/0009-v1.0.0.md`.
+
 ## 0.7.0
 
 Benchmark suite: no runtime change. `Reader.js` is byte-identical to 0.6.2 (only its

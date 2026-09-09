@@ -7,7 +7,13 @@ fields with NO allocation, at ANY byte offset, with EXPLICIT endianness. Reads
 through a DataView, so a field may sit at an odd (unaligned) offset a typed-array
 lane cannot address. Single-file ESM, zero runtime dependencies, node:test only.
 
-## Status: 0.7.0 - S13: benchmark suite (fast / zero-GC / tiny / saves-traffic; split-class closed)
+## Status: 1.0.0 - STABLE. Frozen contract: the R_* code union is exactly 10, the
+type-code table is exactly 8 (codes 0-7), and the full read surface (getX / get /
+seek+cursor / readRow / laneOf / bytes / fromBaked / fromLBK1Shard) is stable -- all
+gated by the dts-drift test. Breaking any of these is a 2.0.0. Post-1.0 additions are
+ADDITIVE minors that do not change what 1.0.0 shipped: S9 64-bit lanes (i64/u64 via
+BigInt; the one place the type table moves, 8 -> 10), S10 per-field endianness, S11
+.d.ts record inference, S12 zero-alloc iterator sugar. decisions/0009 records the freeze.
 
 S0 landed the reader and the sibling constructors. S1 hardened the construction
 door (BR-01..BR-04). S2 closed the view-window and sibling-shape holes
@@ -181,11 +187,11 @@ carries a coded `R_*` tag on `error.code`:
                     bytes() span reads past the buffer
 - R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
 
-## API (0.7.0)
+## API (1.0.0)
 
 Named exports from `@zakkster/lite-binary-reader`:
 
-- VERSION: '0.7.0'
+- VERSION: '1.0.0'
 - IS_LITTLE_ENDIAN: boolean (host byte order, detected once)
 - T_F32=0, T_F64=1, T_I32=2, T_I16=3, T_I8=4, T_U32=5, T_U16=6, T_U8=7
 - LiteBinaryReaderError: Error subclass; `.code` carries the R_* tag

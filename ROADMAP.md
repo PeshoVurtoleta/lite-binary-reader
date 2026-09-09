@@ -41,8 +41,9 @@ and none of the test/torture/docs/`.d.ts`/cooperation work exists yet.
 | API sugar (row cursor, out-param fill, variable-length, typed lanes) | S4 |
 | cooperation proof: lite-bake / lite-bake-stream | S5 |
 | cooperation adapter: lite-query streaming | S6 |
-| README + llms.txt + CHANGELOG | S7 |
-| release gate | S8 |
+| README + llms.txt + CHANGELOG | **done (S7 + S7c demos)** |
+| benchmark suite (four axes) | **done (S13 as v0.7.0)** |
+| release gate / v1.0.0 contract freeze | **done (S8)** |
 
 ---
 
@@ -714,10 +715,15 @@ NOTE: repo-only, no runtime change -- folds into the S7 docs release (or a 0.6.x
   Reader.js stays byte-identical.
 
 ===============================================================================
-# S8 -- v1.0.0 -- release gate
+# S8 -- v1.0.0 -- release gate  [DONE]
 ===============================================================================
 ```markdown
-status: planned
+status: DONE (v1.0.0). Contract frozen (R_* union 10, type table 8, full read
+        surface), status building -> stable, decisions/0009 records the freeze.
+        verify 98/0, torture ok, controls ok; Reader.js byte-identical (VERSION
+        only). Registry residual resolved (0.5.0-0.7.0 published to the package +
+        repo; URLs self-consistent). S13 benchmark landed as 0.7.0 ahead of the
+        freeze, so 1.0.0 ships WITH the ## Performance numbers. Post-1.0: S9-S12.
 depends_on: [S2, S3, S4, S6]
 ```
 `npm run verify` green (test + torture + controls). Three-place VERSION sync
