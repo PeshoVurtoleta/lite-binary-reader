@@ -133,13 +133,14 @@ test('(a) code-union parity: fail() R_* codes === ReaderErrorCode union', () => 
   const diffs = setDiff(failCodes(JS), unionCodes(DTS), 'Reader.js', 'Reader.d.ts union');
   assert.deepEqual(diffs, [], diffs.join('; '));
   assert.equal(failCodes(JS).size, 10, 'the R_* union must stay exactly 10 codes');
-  // The type-code table is a frozen invariant too: TYPE_COUNT and the TYPE_BYTES
-  // width table must both stay at exactly 8 (S4 adds no new type code).
-  assert.match(JS, /const TYPE_COUNT = 8;/, 'TYPE_COUNT must stay exactly 8');
+  // The type-code table: S9 (v1.1.0) moves it 8 -> 10 (T_I64/T_U64), the single
+  // sanctioned move of the 1.0.0 freeze, in LOCK-STEP with Reader.js. TYPE_COUNT
+  // and the TYPE_BYTES width table must both stay at exactly 10.
+  assert.match(JS, /const TYPE_COUNT = 10;/, 'TYPE_COUNT must stay exactly 10');
   const tbMatch = /const TYPE_BYTES = \[([^\]]*)\]/.exec(JS);
   assert.ok(tbMatch, 'Reader.js has no TYPE_BYTES table');
   const entries = tbMatch[1].split(',').map((s) => s.trim()).filter((s) => s.length > 0);
-  assert.equal(entries.length, 8, 'TYPE_BYTES must have exactly 8 entries, saw ' + entries.length);
+  assert.equal(entries.length, 10, 'TYPE_BYTES must have exactly 10 entries, saw ' + entries.length);
 });
 
 test('(b) export parity: value exports agree + class members present in both', () => {

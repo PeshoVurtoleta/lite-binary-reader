@@ -104,14 +104,15 @@ Existing options: hand-rolled `DataView` offset arithmetic (correct, but you re-
 
 - **`new LiteBinaryReader(source, options)`** -- the reader. `source` is an `ArrayBuffer` or any view (`TypedArray` or `DataView`); `options` is the `{ schema, stride?, count?, littleEndian?, byteOffset? }` layout. The constructor validates and compacts the schema into SoA tables, resolves the owned buffer, and freezes the shape. Build it once per `(source, layout)`; reuse it across the read loop.
   - **`getF64`..`getU8`(row, fieldId)** -- eight typed reads, one per type code. Each call site is monomorphic and branch-free: `reader.getF32(i, x)` pays no type switch.
-  - **`get(row, fieldId)`** -- the generic read; dispatches on the field's stored type code (one branch). Reach for it when the type is data-driven (a mixed-schema walk, tooling, debug); reach for a typed `getX` in a tight loop.
+  - **`getI64` / `getU64`(row, fieldId)** -- the two 64-bit lanes (S9), returning a `bigint`. Identical hot-path shape to the eight above, with one honest difference: a `BigInt` is a heap value, so these **allocate** per read -- the second documented exception alongside `bytes()`. The zero-GC guarantee is unqualified on the 8 primitive-number lanes.
+  - **`get(row, fieldId)`** -- the generic read; dispatches on the field's stored type code (one branch). Reach for it when the type is data-driven (a mixed-schema walk, tooling, debug); reach for a typed `getX` in a tight loop. Returns `number | bigint` (a `bigint` for a 64-bit field).
   - **`seek(row)` + `f64`..`u8`(fieldId) + `val(fieldId)`** -- a row cursor for sequential scans: seek a row once, then read its fields without re-passing the row. The cursor reads are the `getX` bodies with the seeked row substituted -- still zero-allocation.
   - **`readRow(row, out)`** -- fills a caller-owned sink (an `Array` or any `TypedArray`) indexed by field id, no record object materialized -- the SoA-to-AoS bridge.
   - **`laneOf(fieldId)`** -- an opt-in typed-array lane for the absolute hot loop: for a naturally aligned, host-endian field it hands back a `{ view, elemStride, elemOffset }` you index directly (`view[row*elemStride + elemOffset]`), skipping the `DataView` call; for any other field it returns `null` and you fall back to `getX`.
   - **`bytes(row, fieldId, len)`** and **`bytes(row, fieldId)`** -- a borrowed `Uint8Array` view over raw bytes: the escape hatch for a blob or variable-length field. The two-argument form reads the span length from a sibling `lengthField`. Copy what you keep.
   - **`field` / `typeOf` / `offsetOf`** -- name-to-id resolution and per-field introspection.
 - **`LiteBinaryReader.fromBaked(baked, options?)`** and **`fromLBK1Shard(shard, options?)`** -- two cold constructors that read a sibling's output directly (see [Sibling cooperation](#sibling-cooperation)).
-- **Type-code constants** -- `T_F32`..`T_U8` (0..7), byte-for-byte `lite-bake`'s table, plus `IS_LITTLE_ENDIAN` and `VERSION`.
+- **Type-code constants** -- `T_F32`..`T_U8` (0..7), byte-for-byte `lite-bake`'s table, plus the 64-bit `T_I64` (8) / `T_U64` (9) lanes (S9), `IS_LITTLE_ENDIAN`, and `VERSION`.
 - **`LiteBinaryReaderError`** -- one coded error class; `error.code` carries one of exactly ten greppable `R_*` tags. Every degenerate input throws a coded error at the door, so the read loop assumes a valid state.
 
 Full types ship in [`Reader.d.ts`](./Reader.d.ts), kept in lock-step with the runtime by a drift gate. Every export is declared.
@@ -187,10 +188,11 @@ getF64(row, fieldId): number   getF32(row, fieldId): number
 getI32(row, fieldId): number   getU32(row, fieldId): number
 getI16(row, fieldId): number   getU16(row, fieldId): number
 getI8(row, fieldId): number    getU8(row, fieldId): number
-get(row, fieldId): number      // generic; dispatches on the stored type code
+getI64(row, fieldId): bigint   getU64(row, fieldId): bigint   // 64-bit lanes -- ALLOCATE a BigInt
+get(row, fieldId): number | bigint   // generic; dispatches on the stored type code
 ```
 
-`row` is in `[0, count)` and `fieldId` is a valid id -- **unchecked for speed**. Validation lives at the door, not per read. One method per type keeps each call site monomorphic; use a typed `getX` in a tight loop and `get` only when the type is data-driven. Every one of these allocates **nothing**.
+`row` is in `[0, count)` and `fieldId` is a valid id -- **unchecked for speed**. Validation lives at the door, not per read. One method per type keeps each call site monomorphic; use a typed `getX` in a tight loop and `get` only when the type is data-driven. The **eight primitive-number getters** (`getF64`..`getU8`) allocate **nothing**. The two 64-bit getters (`getI64`/`getU64`) return a `bigint`, which is a heap value by spec, so they **allocate one BigInt per read** -- the second documented exception alongside `bytes()` (see [64-bit lanes](#64-bit-lanes)).
 
 ### The row cursor
 
@@ -308,8 +310,19 @@ Both validate the argument SHAPE before any dereference, so a null or malformed 
 | `T_U32`  | 5     | `getUint32`   | 4             |
 | `T_U16`  | 6     | `getUint16`   | 2             |
 | `T_U8`   | 7     | `getUint8`    | 1             |
+| `T_I64`  | 8     | `getBigInt64` | 8             |
+| `T_U64`  | 9     | `getBigUint64`| 8             |
 
-Byte-for-byte `@zakkster/lite-bake`'s `Types` table, so a `lite-bake` schema drops into this reader unchanged. `IS_LITTLE_ENDIAN` (the host byte order, detected once) and `VERSION` (`'0.6.0'`) are also exported.
+Codes 0-7 are byte-for-byte `@zakkster/lite-bake`'s `Types` table, so a `lite-bake` schema drops into this reader unchanged. Codes 8-9 are the 64-bit lanes added in 1.1.0 (see [64-bit lanes](#64-bit-lanes)). `IS_LITTLE_ENDIAN` (the host byte order, detected once) and `VERSION` (the shipped version string) are also exported.
+
+### 64-bit lanes
+
+`T_I64` (8) and `T_U64` (9) read a 64-bit integer field. `getI64`/`getU64` (and the cursor `i64`/`u64`, and `get`/`val`/`readRow` on such a field) return a **`bigint`** -- the only representation that carries the full 64-bit range faithfully. A `bigint` is a heap value by spec, so **every 64-bit read allocates one BigInt** (measured ~32 B/read retained). This is deliberate and unavoidable: there is no zero-allocation way to obtain a 64-bit *value* in JS, and every reader that returns 64-bit integers allocates the same way. So `getI64`/`getU64` are the **second documented allocating exception** alongside `bytes()`; the zero-GC guarantee stays **unqualified on the 8 primitive-number lanes** (codes 0-7), which are untouched.
+
+Two edges worth knowing:
+
+- **`readRow` sink.** A mixed 64-bit row yields `number | bigint` cells, and a numeric `TypedArray` sink (e.g. `Float64Array`) **cannot hold a BigInt** -- it throws a `TypeError`. Use an `Array` sink for a mixed row, or a `BigInt64Array` / `BigUint64Array` sink for an all-64-bit row of that signedness.
+- **`laneOf`.** A 64-bit field's lane view is a `BigInt64Array` / `BigUint64Array` (same host-endian + 8-aligned eligibility as any other width). Obtaining the view is still 0 B/op and it is the fastest **bulk** 64-bit path, but each element read mints a BigInt -- so it is an **allocating** lane, distinct from the 8 that are truly zero-alloc.
 
 ### Error codes
 
@@ -374,16 +387,18 @@ One `LiteBinaryReader` does all its allocation in the constructor: it compacts t
 | Operation | Steady-state allocations |
 | --------- | ------------------------ |
 | `getF64`..`getU8`  | **0** |
-| `get` (generic)    | **0** |
-| `seek` + `f64`..`u8` / `val` (cursor) | **0** |
-| `readRow(row, out)` into a reused sink | **0** |
+| `get` (generic, on a primitive field) | **0** |
+| `seek` + `f64`..`u8` / `val` (cursor, primitive) | **0** |
+| `readRow(row, out)` into a reused sink (primitive row) | **0** |
 | `laneOf(fieldId)` call | **0** (a lookup returning a precomputed frozen descriptor) |
-| lane read loop (`view[row*elemStride+elemOffset]`) | **0** |
+| lane read loop (`view[row*elemStride+elemOffset]`, primitive) | **0** |
 | `field` / `typeOf` / `offsetOf` | **0** |
+| `getI64` / `getU64` / `i64` / `u64` (64-bit lanes) | **one BigInt per read** (documented exception; a BigInt is a heap value) |
+| 64-bit lane read loop (`BigInt64Array` element) | **one BigInt per read** (view is 0 B/op; the element read allocates) |
 | `bytes(row, field[, len])` | one `Uint8Array` view wrapper (documented; not for the frame hot path) |
 | constructor        | once, per `(source, layout)` -- SoA tables + `DataView`; a non-full-span view also copies to an owned window; a lane view per present eligible type |
 
-Each new hot surface carries its own zero-alloc and retained-alloc gate: the cursor reads and `readRow` are held to **0 B/op** and **0 retained bytes** the same way the typed getters are.
+Each new hot surface carries its own zero-alloc and retained-alloc gate: the cursor reads and `readRow` are held to **0 B/op** and **0 retained bytes** the same way the typed getters are. The two 64-bit lanes are the exception, and the torture suite **proves** rather than assumes it: a dedicated gate retains a batch of `getI64` results and asserts the heap grows well past a 100 KB floor (and strictly above the identical-shape primitive loop), the positive companion to the eight 0-B/op gates.
 
 The one cold branch is the throw path: a coded error is built (and its message concatenated) only when a read is invalid, never in steady state. The torture gate (`@zakkster/lite-leak` + `@zakkster/lite-gc-profiler`, run under `--expose-gc`) proves **0 B/op** and **0 retained bytes** across the read loop and prints exactly `ok`. A `LBR_TORTURE_BREAK=1` control injects a retained allocation into that same loop and the alloc gate rejects it with a non-zero exit -- a gate that cannot fail is decorative.
 
@@ -495,17 +510,17 @@ npm run demo:scope       # oscilloscope (browser): serves the repo; open the pri
 
 ## Testing
 
-**98 deterministic tests, all pass**, plus a torture gate that proves leak-freedom (now including a schema-space fuzzer) and a controls run that proves the door.
+**101 deterministic tests, all pass**, plus a torture gate that proves leak-freedom (now including a schema-space fuzzer) and a controls run that proves the door.
 
 ```bash
-npm test                 # 98 node:test cases (contract + boundary + drift guard + cooperation proof + streaming adapter + hardening gates)
+npm test                 # 101 node:test cases (contract + boundary + drift guard + cooperation proof + streaming adapter + hardening gates)
 npm run torture          # @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints "ok"
 npm run torture:controls # the door + coherence controls (every gate can fail)
 npm run verify           # test + torture + controls, the publish gate
 npm run bench            # reproducible benchmark (see Performance) -- repo-only, needs --expose-gc
 ```
 
-The suites cover: read fidelity across every type code and both endiannesses; the full fail-closed construction door (every `R_*` path, including detached-buffer BR-08/BR-09, the unaligned-offset read, the derived-vs-explicit stride and count, and the partial-view copy BR-07); the `bytes()` escape hatch and its bounds; the sibling constructors against malformed input; the cursor, `readRow`, and variable-length surfaces (cursor-vs-`getX` parity, the `readRow` door and its reentrancy, and variable-length spans at nonzero-base and partial-view sources); the typed-lane fast path (`laneOf` eligibility and its decline contract on unaligned, odd-stride, opposite-endian, and out-of-range fields, plus lane-vs-`getX` parity including a BR-07 partial-window source); and the `.d.ts` drift guard (code-union, export, and version parity, with mutation controls). The torture harness runs read-fidelity, degenerate-layout, an adversarial source-x-count-x-offset door matrix asserting throws-iff-incoherent across every source kind (including detached and `DataView`), a cursor-vs-`getX` differential, a lane-vs-`getX` differential across the alignment-x-endianness-x-type matrix (with a stride-mutation control for teeth), per-surface zero-alloc and retained-alloc gates, and a soak witness. `LBR_TORTURE_BREAK=1` injects a retained allocation to prove the gate can fail; no gate output is a FAIL. The cooperation proof (0.5.0) adds node:test suites that read the siblings' REAL output -- `fromBaked` cell-for-cell vs `@zakkster/lite-bake`'s own Reader over mock fixtures spanning all 8 lanes plus NaN/+/-Infinity/-0, `fromLBK1Shard` vs `@zakkster/lite-bake-stream` (F64 bit-exact, U32 as a string-table index, a no-translate control asserted to diverge), a same-schema shard union, a parent/children multi-reader join, and an assertion that `Reader.js` imports no sibling (the siblings are test-only devDependencies). The streaming adapter (0.6.0) adds a peer-surface guard and a `streamQuery` suite: a FOREIGN feed decoded per window through `LiteBinaryReader` and observed in order, abort-on-detach that cancels the in-flight source (no value after abort), reactive-key restart, a `fromLBK1Shard` shard read inside the stream (F64 bit-exact vs bake-stream's own Reader), the structural zero-alloc frame path, and the D9 copy-what-you-keep ownership boundary -- with lite-query a test-only devDependency and no import edge. The 0.6.1 hardening pass adds a torture t8 schema-space fuzzer (thousands of RANDOM legal schemas -- random lane subsets, orders, unaligned offsets, strides, LE/BE -- read cell-for-cell against a `DataView` oracle with a seed-replayable teeth control), a `bytes()` negative gate (it mints a fresh view per call, so it stays a cold-path allocator and can never be quietly folded into the zero-GC hot path), and a README-code subset gate (every `R_*` the docs name is one the reader actually throws). The 0.7.0 pass extends this: the t8 fuzzer now also fills a `readRow` sink at a random row per schema and asserts every cell `Object.is`-equal to the oracle across BOTH an `Array` and a `Float64Array` sink (so `readRow` inherits the same NaN/-0 fidelity `getX` had), a focused unit test pins `readRow` and the cursor bit-exact for the IEEE 754 edge values (`NaN`, `-0`, `+/-Infinity`), and a post-construction-detach test proves that transferring an `ArrayBuffer` away after a reader is built makes a subsequent read throw a CATCHABLE error (no native crash, no silent poison) -- the complement to the construction-time `BR-08`/`BR-09` doors.
+The suites cover: read fidelity across every type code and both endiannesses; the full fail-closed construction door (every `R_*` path, including detached-buffer BR-08/BR-09, the unaligned-offset read, the derived-vs-explicit stride and count, and the partial-view copy BR-07); the `bytes()` escape hatch and its bounds; the sibling constructors against malformed input; the cursor, `readRow`, and variable-length surfaces (cursor-vs-`getX` parity, the `readRow` door and its reentrancy, and variable-length spans at nonzero-base and partial-view sources); the typed-lane fast path (`laneOf` eligibility and its decline contract on unaligned, odd-stride, opposite-endian, and out-of-range fields, plus lane-vs-`getX` parity including a BR-07 partial-window source); and the `.d.ts` drift guard (code-union, export, and version parity, with mutation controls). The torture harness runs read-fidelity, degenerate-layout, an adversarial source-x-count-x-offset door matrix asserting throws-iff-incoherent across every source kind (including detached and `DataView`), a cursor-vs-`getX` differential, a lane-vs-`getX` differential across the alignment-x-endianness-x-type matrix (with a stride-mutation control for teeth), per-surface zero-alloc and retained-alloc gates, and a soak witness. `LBR_TORTURE_BREAK=1` injects a retained allocation to prove the gate can fail; no gate output is a FAIL. The cooperation proof (0.5.0) adds node:test suites that read the siblings' REAL output -- `fromBaked` cell-for-cell vs `@zakkster/lite-bake`'s own Reader over mock fixtures spanning all 8 lanes plus NaN/+/-Infinity/-0, `fromLBK1Shard` vs `@zakkster/lite-bake-stream` (F64 bit-exact, U32 as a string-table index, a no-translate control asserted to diverge), a same-schema shard union, a parent/children multi-reader join, and an assertion that `Reader.js` imports no sibling (the siblings are test-only devDependencies). The streaming adapter (0.6.0) adds a peer-surface guard and a `streamQuery` suite: a FOREIGN feed decoded per window through `LiteBinaryReader` and observed in order, abort-on-detach that cancels the in-flight source (no value after abort), reactive-key restart, a `fromLBK1Shard` shard read inside the stream (F64 bit-exact vs bake-stream's own Reader), the structural zero-alloc frame path, and the D9 copy-what-you-keep ownership boundary -- with lite-query a test-only devDependency and no import edge. The 0.6.1 hardening pass adds a torture t8 schema-space fuzzer (thousands of RANDOM legal schemas -- random lane subsets, orders, unaligned offsets, strides, LE/BE -- read cell-for-cell against a `DataView` oracle with a seed-replayable teeth control), a `bytes()` negative gate (it mints a fresh view per call, so it stays a cold-path allocator and can never be quietly folded into the zero-GC hot path), and a README-code subset gate (every `R_*` the docs name is one the reader actually throws). The 0.7.0 pass extends this: the t8 fuzzer now also fills a `readRow` sink at a random row per schema and asserts every cell `Object.is`-equal to the oracle across BOTH an `Array` and a `Float64Array` sink (so `readRow` inherits the same NaN/-0 fidelity `getX` had), a focused unit test pins `readRow` and the cursor bit-exact for the IEEE 754 edge values (`NaN`, `-0`, `+/-Infinity`), and a post-construction-detach test proves that transferring an `ArrayBuffer` away after a reader is built makes a subsequent read throw a CATCHABLE error (no native crash, no silent poison) -- the complement to the construction-time `BR-08`/`BR-09` doors. The 1.1.0 pass (S9, 64-bit lanes) extends every one of these: the harness oracle and the t8 fuzzer now draw lanes 8/9, so 64-bit reads are checked `Object.is`-equal to a `DataView` `getBigInt64`/`getBigUint64` oracle across LE/BE at the signed/unsigned boundaries (`0n`, `-1n`, `INT64_MIN`, `INT64_MAX`, `UINT64_MAX`); a focused unit suite pins `getI64`/`getU64`/`get`/`val`/`readRow`/`laneOf` fidelity, the `readRow` sink edge (a `Float64Array` sink throws on a BigInt cell; `Array` and `BigInt64Array` sinks succeed), and the moved type boundary (code 10 -> `R_BAD_TYPE`, 8/9 construct); and a new torture gate PROVES the 64-bit surface allocates (retained heap far past a 100 KB floor and strictly above the identical-shape primitive loop) while the eight primitive lanes' 0-B/op gates are unchanged -- a positive allocation assertion, not a hand-wave.
 
 ---
 
@@ -513,7 +528,8 @@ The suites cover: read fidelity across every type code and both endiannesses; th
 
 - **Not a schema/IDL parser.** It reads a layout YOU describe (offsets and types). It does not parse a `.proto`, a FlatBuffers schema, or a self-describing header. `lite-bake-stream` owns the self-describing LBK1 container.
 - **Not a writer or an encoder.** It only reads. `@zakkster/lite-bake` bakes a column store; `@zakkster/lite-bake-stream` frames a stream. This reads their output and any other bytes.
-- **Not a string decoder.** Reads return numbers. A string field is a raw byte span -- use `bytes()` to borrow it and decode it yourself (or resolve a `lite-bake-stream` string index in that package).
+- **Not a string decoder.** Reads return numbers (or a `bigint` for a 64-bit lane). A string field is a raw byte span -- use `bytes()` to borrow it and decode it yourself (or resolve a `lite-bake-stream` string index in that package).
+- **Not zero-GC on the 64-bit lanes.** `T_I64`/`T_U64` return a `bigint`, a heap value, so `getI64`/`getU64` allocate one BigInt per read -- the second documented exception alongside `bytes()`. This is a JS-language reality (no reader returns a 64-bit *value* without allocating), not a design miss; the zero-GC guarantee is exact on the 8 primitive-number lanes. If you need a zero-alloc 64-bit hot loop, read the two halves as `getU32` pairs yourself.
 - **Not a bounds-checked read on the hot path.** `row`/`fieldId` are trusted in the getters by design; the bounds are proven once at the door. Pass an out-of-range `row` and you get whatever `DataView` does, not a coded error. Keep `row` in `[0, count)`.
 - **Not a variable-length *record* reader.** The record model is fixed `stride`. A variable-length *field* within a fixed-stride record is supported -- mark it with a `lengthField` and read the span with `bytes(row, id)` -- but a record whose total size varies row to row is out of scope; walk it with your own cursor over `bytes()` spans.
 - **Not a mutation API.** It is a reader. There is no `setX`. Write with the sibling writers, or your own `DataView`.

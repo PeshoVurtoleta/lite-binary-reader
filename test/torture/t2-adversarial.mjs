@@ -244,7 +244,7 @@ export async function run() {
   // --- 4. the full door matrix (ROADMAP section 4) ----------------------------
   // source {ArrayBuffer, full-span view, zero-offset PARTIAL view, offset view,
   //   full-span DataView, detached} x count {derived,explicit} x byteOffset
-  //   {in-range,==len,past,negative,NaN} x type {integer,2.5,"1",-1,8}
+  //   {in-range,==len,past,negative,NaN} x type {integer,2.5,"1",-1,10}
   //   x offset {int,1.5,-1} x stride {derived,==maxEnd,<maxEnd}.
   // Every cell asserts the CONTRACT: the constructor throws a coded R_* IFF
   // checkCoherence flags the same input non-null, and never throws an UNCODED
@@ -279,7 +279,7 @@ export async function run() {
     { label: '2.5', type: 2.5 },
     { label: '"1"', type: '1' },
     { label: '-1', type: -1 },
-    { label: '8', type: 8 },
+    { label: '10', type: 10 }, // S9: the invalid boundary moved 8 -> 10 (8/9 are now T_I64/T_U64)
   ];
   const M_OFFSETS = [
     { label: 'int', offset: 0 },

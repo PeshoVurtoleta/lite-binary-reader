@@ -22,7 +22,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   LiteBinaryReader, LiteBinaryReaderError, IS_LITTLE_ENDIAN,
-  T_F32, T_F64, T_I32, T_I16, T_I8, T_U32, T_U16, T_U8, VERSION,
+  T_F32, T_F64, T_I32, T_I16, T_I8, T_U32, T_U16, T_U8, T_I64, T_U64, VERSION,
 } from '../Reader.js';
 
 /** Assert `fn` throws a LiteBinaryReaderError carrying exactly `code`. */
@@ -31,8 +31,8 @@ function assertCode(fn, code) {
     'expected a LiteBinaryReaderError with code ' + code);
 }
 
-test('VERSION is the shipped v1.0.0 string', () => {
-  assert.equal(VERSION, '1.0.0');
+test('VERSION is the shipped v1.1.0 string', () => {
+  assert.equal(VERSION, '1.1.0');
 });
 
 // --- S4 (v0.3.0): the cursor, readRow, and variable-length surfaces ----------
@@ -505,13 +505,18 @@ test('P3: R_BAD_COUNT on a fractional (or negative) count', () => {
   assertCode(() => new LiteBinaryReader(new ArrayBuffer(64), { schema, count: -1 }), 'R_BAD_COUNT');
 });
 
-test('R_BAD_TYPE on an out-of-range integer type code (-1, 8) at the constructor door', () => {
+test('R_BAD_TYPE on an out-of-range integer type code (-1, 10) at the constructor door', () => {
   // This door correctly rejects an out-of-range INTEGER type. It is distinct from
   // BR-02 (a non-integer type like 2.5 or "1" that WRONGLY passes this same
   // check) -- pin the working half of it at its own call site, not only via the
   // fromLBK1Shard translation table's reuse of the same R_BAD_TYPE code.
+  // S9: the type table moved 8 -> 10, so 8 (T_I64) and 9 (T_U64) now CONSTRUCT;
+  // the first out-of-range integer is 10, and -1 is still rejected below.
   assertCode(() => new LiteBinaryReader(new ArrayBuffer(64), { schema: [{ name: 'x', type: -1, offset: 0 }] }), 'R_BAD_TYPE');
-  assertCode(() => new LiteBinaryReader(new ArrayBuffer(64), { schema: [{ name: 'x', type: 8, offset: 0 }] }), 'R_BAD_TYPE');
+  assertCode(() => new LiteBinaryReader(new ArrayBuffer(64), { schema: [{ name: 'x', type: 10, offset: 0 }] }), 'R_BAD_TYPE');
+  // The moved boundary admits 8 and 9 (a 64-bit field constructs cleanly).
+  new LiteBinaryReader(new ArrayBuffer(64), { schema: [{ name: 'x', type: 8, offset: 0 }] });
+  new LiteBinaryReader(new ArrayBuffer(64), { schema: [{ name: 'x', type: 9, offset: 0 }] });
 });
 
 test('P9: R_BAD_SCHEMA on missing options / a non-array or empty schema', () => {
@@ -1242,4 +1247,93 @@ test('S4b: laneOf coexists with the pinned getX/get/seek+cursor/readRow/bytes su
     const v = rd.bytes(r, 2);
     assert.equal(v.length, r + 1);
   }
+});
+
+// --- S9 (v1.1.0): 64-bit integer lanes (i64 / u64 via BigInt) ----------------
+// The type table moved 8 -> 10; codes 8 (T_I64) / 9 (T_U64) read as BigInt.
+// BigInt is a heap value by spec, so these two lanes ALLOCATE (the second
+// documented exception alongside bytes()) -- the torture t6 gate proves it. Here
+// we pin fidelity: every 64-bit read path is bit-exact vs a DataView oracle
+// across LE and BE, at the signed/unsigned boundaries, with Object.is.
+
+const IVALS = [0n, -1n, -(2n ** 63n), 2n ** 63n - 1n, -42n];          // signed range
+const UVALS = [0n, 1n, 2n ** 64n - 1n, 2n ** 63n, 9007199254740993n]; // unsigned range
+
+/** A 2-field 64-bit fixture (i64 @0, u64 @8; stride 16) filled by a DataView
+ *  oracle at byte order `le`, one boundary pair per row. */
+function sixtyFourFixture(le) {
+  const rows = IVALS.length;
+  const stride = 16;
+  const buf = new ArrayBuffer(rows * stride);
+  const dv = new DataView(buf);
+  for (let r = 0; r < rows; r++) {
+    dv.setBigInt64(r * stride + 0, IVALS[r], le);
+    dv.setBigUint64(r * stride + 8, UVALS[r], le);
+  }
+  const schema = [{ name: 'i', type: T_I64, offset: 0 }, { name: 'u', type: T_U64, offset: 8 }];
+  const rd = new LiteBinaryReader(buf, { schema, stride, littleEndian: le });
+  return { rd, dv, rows, stride, le };
+}
+
+test('S9: getI64/getU64 are bit-exact at the 64-bit boundaries, LE and BE', () => {
+  for (const le of [true, false]) {
+    const { rd, dv, rows, stride } = sixtyFourFixture(le);
+    for (let r = 0; r < rows; r++) {
+      const oi = dv.getBigInt64(r * stride + 0, le);
+      const ou = dv.getBigUint64(r * stride + 8, le);
+      // typed getters
+      assert.ok(Object.is(rd.getI64(r, 0), oi), 'getI64 le=' + le + ' r=' + r);
+      assert.ok(Object.is(rd.getU64(r, 1), ou), 'getU64 le=' + le + ' r=' + r);
+      // data-driven get()
+      assert.ok(Object.is(rd.get(r, 0), oi), 'get i64 le=' + le + ' r=' + r);
+      assert.ok(Object.is(rd.get(r, 1), ou), 'get u64 le=' + le + ' r=' + r);
+      // cursor (i64/u64 + data-driven val)
+      assert.ok(Object.is(rd.seek(r).i64(0), oi), 'cursor i64 le=' + le + ' r=' + r);
+      assert.ok(Object.is(rd.seek(r).u64(1), ou), 'cursor u64 le=' + le + ' r=' + r);
+      assert.ok(Object.is(rd.seek(r).val(0), oi), 'cursor val i64 le=' + le + ' r=' + r);
+      assert.ok(Object.is(rd.seek(r).val(1), ou), 'cursor val u64 le=' + le + ' r=' + r);
+      // readRow into an Array sink (holds number|bigint)
+      const out = rd.readRow(r, new Array(2));
+      assert.ok(Object.is(out[0], oi) && Object.is(out[1], ou), 'readRow le=' + le + ' r=' + r);
+    }
+    // non-vacuity: the fixture really carries the extreme values.
+    assert.ok(Object.is(rd.getI64(2, 0), -(2n ** 63n)), 'INT64_MIN present');
+    assert.ok(Object.is(rd.getU64(2, 1), 2n ** 64n - 1n), 'UINT64_MAX present');
+  }
+});
+
+test('S9: readRow sink edge -- a Float64Array cannot hold a BigInt (documented, throws)', () => {
+  const { rd } = sixtyFourFixture(true);
+  // A mixed/64-bit row into a Float64Array sink: assigning a BigInt cell throws a
+  // raw TypeError. This is the API contract, NOT a bug -- use an Array sink for a
+  // mixed 64-bit row, or a BigInt64Array sink for an all-64-bit signed row.
+  assert.throws(() => rd.readRow(0, new Float64Array(2)), TypeError);
+  // An Array sink holds both cell kinds fine.
+  const arr = rd.readRow(0, new Array(2));
+  assert.ok(Object.is(arr[0], rd.getI64(0, 0)) && Object.is(arr[1], rd.getU64(0, 1)));
+  // A BigInt64Array sink works for an ALL-i64 row (both cells are signed BigInts).
+  const buf = new ArrayBuffer(16), dv = new DataView(buf);
+  dv.setBigInt64(0, -(2n ** 63n), true);
+  dv.setBigInt64(8, 2n ** 63n - 1n, true);
+  const rd2 = new LiteBinaryReader(buf, {
+    schema: [{ name: 'a', type: T_I64, offset: 0 }, { name: 'b', type: T_I64, offset: 8 }], stride: 16,
+  });
+  const bi = rd2.readRow(0, new BigInt64Array(2));
+  assert.ok(Object.is(bi[0], rd2.getI64(0, 0)) && Object.is(bi[1], rd2.getI64(0, 1)), 'BigInt64Array sink');
+});
+
+test('S9: laneOf over a host-endian 64-bit field returns a BigInt view that matches getI64/getU64', () => {
+  const { rd, rows } = sixtyFourFixture(IS_LITTLE_ENDIAN); // host order -> lane eligible, 8-aligned
+  const Li = rd.laneOf(0), Lu = rd.laneOf(1);
+  assert.notEqual(Li, null, 'i64 lane eligible (host-endian, 8-aligned)');
+  assert.notEqual(Lu, null, 'u64 lane eligible');
+  assert.ok(Li.view instanceof BigInt64Array, 'i64 lane view is a BigInt64Array');
+  assert.ok(Lu.view instanceof BigUint64Array, 'u64 lane view is a BigUint64Array');
+  for (let r = 0; r < rows; r++) {
+    assert.ok(Object.is(Li.view[r * Li.elemStride + Li.elemOffset], rd.getI64(r, 0)), 'i64 lane r=' + r);
+    assert.ok(Object.is(Lu.view[r * Lu.elemStride + Lu.elemOffset], rd.getU64(r, 1)), 'u64 lane r=' + r);
+  }
+  // Opposite-endian reader declines the 64-bit lane (never a wrong-endian lane).
+  const opp = sixtyFourFixture(!IS_LITTLE_ENDIAN).rd;
+  assert.equal(opp.laneOf(0), null, 'opposite-endian 64-bit lane declines to null');
 });

@@ -19,10 +19,12 @@ export declare const T_I8: 4;
 export declare const T_U32: 5;
 export declare const T_U16: 6;
 export declare const T_U8: 7;
+export declare const T_I64: 8;
+export declare const T_U64: 9;
 
 export declare const IS_LITTLE_ENDIAN: boolean;
 
-export declare type TypeCode = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
+export declare type TypeCode = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
 
 export declare interface Field {
   name: string | number;
@@ -61,7 +63,9 @@ export declare interface Lane {
     | Int8Array
     | Uint32Array
     | Uint16Array
-    | Uint8Array;
+    | Uint8Array
+    | BigInt64Array
+    | BigUint64Array;
   elemStride: number;
   elemOffset: number;
 }
@@ -101,7 +105,9 @@ export declare class LiteBinaryReader {
   getU16(row: number, fieldId: number): number;
   getI8(row: number, fieldId: number): number;
   getU8(row: number, fieldId: number): number;
-  get(row: number, fieldId: number): number;
+  getI64(row: number, fieldId: number): bigint;
+  getU64(row: number, fieldId: number): bigint;
+  get(row: number, fieldId: number): number | bigint;
   seek(row: number): this;
   f64(fieldId: number): number;
   f32(fieldId: number): number;
@@ -111,8 +117,10 @@ export declare class LiteBinaryReader {
   u16(fieldId: number): number;
   i8(fieldId: number): number;
   u8(fieldId: number): number;
-  val(fieldId: number): number;
-  readRow(row: number, out: { length: number; [i: number]: number }): { length: number; [i: number]: number };
+  i64(fieldId: number): bigint;
+  u64(fieldId: number): bigint;
+  val(fieldId: number): number | bigint;
+  readRow(row: number, out: { length: number; [i: number]: number | bigint }): { length: number; [i: number]: number | bigint };
   bytes(row: number, fieldId: number): Uint8Array;
   bytes(row: number, fieldId: number, len: number): Uint8Array;
   static fromBaked(baked: Baked, options?: Options): LiteBinaryReader;

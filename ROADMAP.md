@@ -746,10 +746,17 @@ Pre-1.0 hardening (S7b: schema-space fuzzer + bytes() negative gate + README-cod
 subset check) lands before S8, not here.
 
 ===============================================================================
-# S9 -- v1.1.0 -- 64-bit integer lanes (i64 / u64 via BigInt)  [HIGH VALUE]
+# S9 -- v1.1.0 -- 64-bit integer lanes (i64 / u64 via BigInt)  [DONE]
 ===============================================================================
 ```markdown
-status: planned (post-1.0)
+status: DONE (v1.1.0). Type table moved 8 -> 10 (T_I64=8, T_U64=9) in lock-step
+  with the drift gate; R_* union unchanged at 10. getI64/getU64 + cursor i64/u64 +
+  the get/val/readRow arms return number|bigint; laneOf yields BigInt64Array/
+  BigUint64Array views. All 8 primitive read bodies byte-identical (proven by diff
+  and the unchanged t6 0-B/op gates). D1-D4 accepted as recommended (D2/D4 = no).
+  The 64-bit lanes ALLOCATE (BigInt is a heap value) -- the second documented
+  exception alongside bytes(); a new t6 Gate 5 PROVES it. verify 101/0, torture ok,
+  controls ok. decisions/0010 records it. Awaiting /release 1.1.0 + publish.
 depends_on: [S8]
 ```
 PURPOSE
@@ -763,14 +770,22 @@ TASKS
   - Reader.d.ts: the two codes, the two getters, the BigInt return type on the data-
     driven paths (readRow into a BigInt64Array sink; number|bigint union documented).
   - Coordinate with @zakkster/lite-bake's Types (does it mint i64/u64? read its
-    llms.txt -- do NOT assume). fromBaked/fromLBK1Shard translation extended if so.
+    llms.txt -- do NOT assume). CHECKED (S8 follow-up, see BRIEF.md): lite-bake mints
+    NO 64-bit lane (it infers F64 and refuses E_UNSAFE_INTEGER past 2^53-1), and
+    lite-bake-stream lists "I64 lane" as a FUTURE addition -- so NEITHER fromBaked nor
+    fromLBK1Shard needs 64-bit translation now; leave a seam for bake-stream's future
+    I64 lane.
 INVARIANT CHANGE (deliberate, gated): the dts-drift "type table exactly 8" assertion
   becomes exactly 10; the R_* union is UNCHANGED at 10. This is the ONE place the
   frozen type-table count moves, and it is an explicit, additive 1.1.0 decision -- the
-  drift gate is updated in lock-step, not bypassed. Torture gains i64/u64 fidelity +
-  0-B/op lane rows (BigInt reads box; the zero-alloc claim is scoped honestly -- a
-  BigInt result is not a primitive number, so getBigX allocates the BigInt; laneOf
-  over a BigInt64Array is the zero-alloc path for the hot 64-bit loop).
+  drift gate is updated in lock-step, not bypassed. CORRECTION (measured, S8 follow-up):
+  64-bit reads CANNOT be zero-alloc -- a BigInt is a heap value by spec, so BOTH
+  getBigInt64 AND a BigInt64Array element read (`lane.view[i]`) mint a BigInt (~533 KB
+  over 1e6 reads, measured). i64/u64 is therefore an inherently-allocating read surface,
+  the second documented exception alongside bytes(); the zero-GC guarantee is scoped to
+  the 8 primitive-number lanes. Torture ADDS a positive "these lanes allocate" assertion
+  (not a 0-B/op gate) and keeps the 8 primitive lanes' 0-B/op gates unchanged. See
+  BRIEF.md (D1-D4) for the decisions.
 DONE WHEN
   i64/u64 read bit-exact vs a DataView oracle across LE/BE; laneOf serves the aligned
   host-endian 64-bit lane; drift gate asserts table=10; CHANGELOG notes the additive

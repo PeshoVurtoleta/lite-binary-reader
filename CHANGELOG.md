@@ -2,6 +2,42 @@
 
 All notable changes to `@zakkster/lite-binary-reader`.
 
+## 1.1.0
+
+64-bit integer lanes (S9). The one sanctioned move of a frozen 1.0.0 invariant: the
+type-code table goes 8 -> 10, in lock-step with the drift gate. Additive -- every
+1.0.0 read body for the 8 primitive lanes (codes 0-7) is byte-identical; the new
+lanes only ADD switch arms and two methods, never edit an existing one.
+
+### Added
+- `T_I64 = 8`, `T_U64 = 9` type codes; `TYPE_BYTES`/`TYPE_CTOR` grow to 10 entries
+  (`BigInt64Array` / `BigUint64Array` constructors).
+- `getI64(row, id) -> bigint` and `getU64(row, id) -> bigint`; the matching cursor
+  reads `i64(id)` / `u64(id)`. `get`, `val`, and `readRow` gain the two cases and
+  now return / write `number | bigint`.
+- `laneOf` over a 64-bit field returns a `BigInt64Array` / `BigUint64Array` view
+  (same host-endian + 8-aligned eligibility). Obtaining the view is 0 B/op; each
+  element read allocates a BigInt (labelled an allocating lane).
+- `Reader.d.ts`: `T_I64` / `T_U64` literals, the `bigint` getter/cursor signatures,
+  and the `number | bigint` union on `get` / `val` / `readRow`.
+
+### Changed
+- The type-code table is now **10** (codes 0-9). The `dts-drift` gate's
+  `TYPE_COUNT` / `TYPE_BYTES`-length assertions move to 10 in lock-step, with the
+  R_* union assertion unchanged at exactly 10 (no new error code).
+
+### Notes (the honest boundary)
+- A JS BigInt is a heap value by spec, so a 64-bit read ALWAYS allocates: both
+  `getI64`/`getU64` and a `BigInt64Array` element read mint a BigInt (measured
+  ~32 B/read retained). i64/u64 is therefore the SECOND documented allocating
+  exception alongside `bytes()`; the zero-GC guarantee stays unqualified on the 8
+  primitive-number lanes. A new torture gate (t6 Gate 5) PROVES the allocation
+  rather than asserting it, while the 8 primitive lanes' 0-B/op gates are unchanged.
+- A mixed 64-bit row read with `readRow` needs an `Array` sink (a `Float64Array`
+  sink throws on a BigInt cell); an all-64-bit row can use a `BigInt64Array` sink.
+- No sibling translation this release: neither lite-bake nor lite-bake-stream mints
+  a 64-bit lane today (decisions/0010, D4). `fromBaked` / `fromLBK1Shard` unchanged.
+
 ## 1.0.0
 
 Stable release. No runtime change: `Reader.js` is byte-identical to 0.7.0 (only its

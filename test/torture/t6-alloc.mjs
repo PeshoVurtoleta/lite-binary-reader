@@ -44,6 +44,10 @@ const SCHEMA = [
 /** Retained sink for the BREAK control -- survives GC so arrayBuffers grows. */
 const leak = [];
 
+/** Pins the Gate 5 retained containers past their measurement so V8 cannot
+ *  dead-code-eliminate the reads whose allocation we are proving. */
+const keepAlive = [];
+
 // Hoisted so the hot body closes over primitives/views, never allocates.
 const sink = new Float64Array(1);
 // Module-hoisted readRow sink -- reused across every measured call (Gate 3).
@@ -200,4 +204,59 @@ export async function run() {
     die('T6 Gate 4b (lane read) retained-alloc gate rejected -- verdict=' + g4c.report.verdict +
       ' settled=' + g4c.result.settled + ' bytesPerCall=' + g4c.bytesPerCall);
   }
+
+  // --- Gate 5: PROOF that the 64-bit lanes ALLOCATE (the S9 exception) ---------
+  // The 8 primitive lanes are 0 B/op retained (Gates 1b/2a/3a/4). The two 64-bit
+  // lanes CANNOT be: a JS BigInt is a heap value by spec, so getI64/getU64 (and a
+  // BigInt64Array element read) mint one per read -- the second documented
+  // exception alongside bytes(). runAllocsGate is a RETENTION detector: transient
+  // BigInts die before its post-settle read, so it reports the residue (~0), NOT
+  // the allocation. To prove the allocation we RETAIN the values and measure the
+  // heap directly: N BigInts kept alive cost heap; the same-shape primitive loop,
+  // kept alive in a typed sink, costs essentially none. That gap IS the exception.
+  if (typeof globalThis.gc !== 'function') die('T6 Gate 5 requires --expose-gc');
+  const N64 = 200000;
+  // A 64-bit fixture: one i64 field, host-endian, tightly packed (stride 8).
+  const buf64 = new ArrayBuffer(8 * COUNT);
+  const dv64 = new DataView(buf64);
+  for (let r = 0; r < COUNT; r++) dv64.setBigInt64(r * 8, BigInt(r) * 0x0100000001n - 5n, IS_LITTLE_ENDIAN);
+  const r64 = new LiteBinaryReader(buf64, { schema: [{ name: 'i64', type: 8, offset: 0 }], stride: 8, littleEndian: IS_LITTLE_ENDIAN });
+
+  // heapUsed growth of retaining N reads produced by `fill(N)` (its return value
+  // is kept alive). gc() after the fill drops transients so only the retained
+  // set -- the thing we are pricing -- remains in the delta.
+  const growthRetaining = (fill) => {
+    globalThis.gc(); globalThis.gc();
+    const before = process.memoryUsage().heapUsed;
+    const kept = fill(N64);
+    globalThis.gc();
+    const after = process.memoryUsage().heapUsed;
+    keepAlive.push(kept); // pin past the read: no DCE of the priced reads
+    return after - before;
+  };
+
+  // BigInt arm: retain N getI64 results (each a freshly boxed BigInt).
+  const bigintGrowth = growthRetaining((n) => {
+    const s = new Array(n);
+    for (let k = 0; k < n; k++) s[k] = r64.getI64(k & MASK, 0);
+    return s;
+  });
+  // Primitive arm: the SAME loop shape reading a primitive lane into a typed sink
+  // -- no per-element boxing, so the read itself allocates nothing on the heap.
+  const primGrowth = growthRetaining((n) => {
+    const s = new Float64Array(n);
+    for (let k = 0; k < n; k++) s[k] = reader.getU32(k & MASK, 3);
+    return s;
+  });
+
+  // Teeth 1: retaining N BigInts costs real heap -- far past a 100 KB floor that a
+  // non-allocating read could never reach (N=200000 boxed BigInts is multi-MB).
+  check(bigintGrowth > 100000,
+    () => 'T6 Gate 5: getI64 retained ' + N64 + ' reads but heap grew only ' + bigintGrowth +
+      ' B -- expected a BigInt allocation per read');
+  // Teeth 2: the 64-bit path costs strictly more heap than the identical-shape
+  // primitive path -- the delta is the per-read BigInt boxing, isolated.
+  check(bigintGrowth > primGrowth,
+    () => 'T6 Gate 5: getI64 heap growth ' + bigintGrowth + ' B did not exceed the primitive path ' +
+      primGrowth + ' B -- the BigInt allocation is not being observed');
 }

@@ -70,9 +70,9 @@ export const ALLOC_RULES = { maxBytesPerCall: 1 };
  * Width in bytes per type code, indexed by the code itself. A local copy so the
  * harness imports nothing from the source on the door-invariant path. Kept in
  * lock-step with Reader.js's TYPE_BYTES by the T5 drift note.
- *   F32=0, F64=1, I32=2, I16=3, I8=4, U32=5, U16=6, U8=7
+ *   F32=0, F64=1, I32=2, I16=3, I8=4, U32=5, U16=6, U8=7, I64=8, U64=9
  */
-export const TYPE_BYTES = [4, 8, 4, 2, 1, 4, 2, 1];
+export const TYPE_BYTES = [4, 8, 4, 2, 1, 4, 2, 1, 8, 8];
 
 /** Seeded xorshift32. Returns a function yielding a uint32 each call. */
 export function makePrng(seed) {
@@ -188,7 +188,7 @@ export async function settleGc(cycles) {
  *   0 <= base  AND  base <= buffer.byteLength                         (BR-01, BR-03)
  *   count is a non-negative integer AND base + count*stride <= len    (BR-01)
  *   for every field f:
- *     Number.isInteger(type[f]) AND 0 <= type[f] < 8                   (BR-02)
+ *     Number.isInteger(type[f]) AND 0 <= type[f] < 10                  (BR-02)
  *     Number.isInteger(offset[f]) AND offset[f] >= 0
  *     offset[f] + TYPE_BYTES[type[f]] <= stride                       (BR-02 stride)
  *
@@ -239,8 +239,8 @@ export function checkCoherence(source, options) {
     const f = fields[i];
     if (!f || typeof f !== 'object') return 'field ' + i + ' is not an object';
     const t = f.type;
-    if (!Number.isInteger(t) || t < 0 || t >= 8) {
-      return "field '" + f.name + "' type is not an integer in 0..7: " + t;
+    if (!Number.isInteger(t) || t < 0 || t >= 10) {
+      return "field '" + f.name + "' type is not an integer in 0..9: " + t;
     }
     const o = f.offset;
     if (!Number.isInteger(o) || o < 0) {
@@ -304,6 +304,8 @@ export function oracleRead(dv, type, pos, le) {
     case 3: return dv.getInt16(pos, le);   // T_I16
     case 6: return dv.getUint16(pos, le);  // T_U16
     case 4: return dv.getInt8(pos);        // T_I8
+    case 8: return dv.getBigInt64(pos, le);  // T_I64 (allocates a BigInt)
+    case 9: return dv.getBigUint64(pos, le); // T_U64 (allocates a BigInt)
     default: return dv.getUint8(pos);      // T_U8 (7)
   }
 }
@@ -318,6 +320,8 @@ export function typedRead(reader, type, row, id) {
     case 3: return reader.getI16(row, id);
     case 6: return reader.getU16(row, id);
     case 4: return reader.getI8(row, id);
+    case 8: return reader.getI64(row, id);
+    case 9: return reader.getU64(row, id);
     default: return reader.getU8(row, id);
   }
 }

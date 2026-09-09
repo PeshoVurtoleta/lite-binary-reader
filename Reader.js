@@ -23,10 +23,20 @@
  * integer id (resolve a name -> id ONCE with `field(name)`, then index in the
  * hot loop), the same `get(index, field)` shape the ecosystem uses.
  *
- * Type codes (D3). IDENTICAL to lite-bake's `Types` table, so a lite-bake
- * `schema` drops in unchanged. LBK1's `lane_kind` is a DIFFERENT table that
- * collides by value (only F64==1 is shared); `fromLBK1Shard` TRANSLATES it, so
- * a single ambiguous integer never crosses the boundary.
+ * Type codes (D3). Codes 0-7 are IDENTICAL to lite-bake's `Types` table, so a
+ * lite-bake `schema` drops in unchanged. S9 (v1.1.0) appends two 64-bit integer
+ * lanes -- T_I64=8, T_U64=9 -- read as `BigInt`. LBK1's `lane_kind` is a DIFFERENT
+ * table that collides by value (only F64==1 is shared); `fromLBK1Shard` TRANSLATES
+ * it, so a single ambiguous integer never crosses the boundary.
+ *
+ * The 64-bit exception (S9). A JS BigInt is a heap value BY SPEC, so a 64-bit read
+ * ALWAYS allocates: BOTH `dv.getBigInt64()` AND `BigInt64Array[i]` mint a BigInt
+ * (~533 KB/1e6 reads, measured). i64/u64 is therefore an inherently-ALLOCATING read
+ * surface -- the SECOND documented exception alongside `bytes()`. The zero-GC
+ * guarantee stays UNQUALIFIED on the 8 primitive-number lanes (codes 0-7) ONLY;
+ * getI64/getU64, the cursor i64/u64, get/val/readRow on a 64-bit field, and a
+ * 64-bit laneOf view are opt-in and explicitly outside it. Every JS reader that
+ * returns 64-bit integers allocates BigInts -- a language reality, not a design miss.
  *
  * Row cursor (D4). For a sequential scan a caller may `seek(row)` ONCE and then
  * read fields without re-passing the row: `r.seek(i).f64(id)`, `r.val(id)`. This
@@ -55,7 +65,7 @@
  *   R_BAD_SOURCE      source is not an ArrayBuffer or a typed-array view, or its
  *                     backing ArrayBuffer has been detached (transferred away)
  *   R_BAD_SCHEMA      schema is not a non-empty array of field descriptors
- *   R_BAD_TYPE        a field.type is not an integer in 0..7
+ *   R_BAD_TYPE        a field.type is not an integer in 0..9
  *   R_BAD_OFFSET      a field.offset (or byteOffset) is not a coherent non-negative
  *                     integer, or byteOffset falls past the end of the buffer
  *   R_BAD_STRIDE      stride is not a positive integer, or < the largest field end
@@ -67,7 +77,7 @@
  *   R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
  */
 
-export const VERSION = "1.0.0";
+export const VERSION = "1.1.0";
 
 // --- type codes -- byte-for-byte lite-bake's `Types` table (D3) --------------
 export const T_F32 = 0;
@@ -78,13 +88,22 @@ export const T_I8 = 4;
 export const T_U32 = 5;
 export const T_U16 = 6;
 export const T_U8 = 7;
-const TYPE_COUNT = 8;
+// --- 64-bit integer lanes (S9, v1.1.0). i64/u64 are read as BigInt, which is a
+// heap value BY SPEC: BOTH dv.getBigInt64() AND BigInt64Array[i] allocate
+// (~533 KB/1e6 reads, measured). So codes 8/9 are an inherently-ALLOCATING read
+// surface -- the SECOND documented exception alongside bytes(). The unqualified
+// zero-GC guarantee stays on the 8 primitive lanes (codes 0-7) ONLY.
+export const T_I64 = 8;
+export const T_U64 = 9;
+const TYPE_COUNT = 10;
 /** Width in bytes per type code, indexed by the code itself. */
-const TYPE_BYTES = [4, 8, 4, 2, 1, 4, 2, 1];
+const TYPE_BYTES = [4, 8, 4, 2, 1, 4, 2, 1, 8, 8];
 /** TypedArray constructor per type code, indexed by the code itself. Used ONLY
  *  by the cold typed-lane pass (laneOf) to build at most one host-order view per
- *  present eligible type; never touched on any read hot path. */
-const TYPE_CTOR = [Float32Array, Float64Array, Int32Array, Int16Array, Int8Array, Uint32Array, Uint16Array, Uint8Array];
+ *  present eligible type; never touched on any read hot path. The 64-bit ctors
+ *  (BigInt64Array/BigUint64Array) yield a lane whose element read allocates a
+ *  BigInt -- an allocating lane, distinct from the 8 that are zero-alloc. */
+const TYPE_CTOR = [Float32Array, Float64Array, Int32Array, Int16Array, Int8Array, Uint32Array, Uint16Array, Uint8Array, BigInt64Array, BigUint64Array];
 
 /** LBK1 `lane_kind` -> our type code (D3). LBK1: 1=F64, 2=F32, 3=U32, 4=U8.
  *  NOTE: an LBK1 U32 cell is a STRING-TABLE INDEX; read raw it is that index
@@ -192,7 +211,7 @@ export class LiteBinaryReader {
             const f = fields[i];
             if (!f || typeof f !== "object") fail("R_BAD_SCHEMA", "field " + i + " is not an object");
             const t = f.type;
-            if (!(Number.isInteger(t) && t >= 0 && t < TYPE_COUNT)) fail("R_BAD_TYPE", "field '" + f.name + "' has type " + t + " (expected an integer 0..7)");
+            if (!(Number.isInteger(t) && t >= 0 && t < TYPE_COUNT)) fail("R_BAD_TYPE", "field '" + f.name + "' has type " + t + " (expected an integer 0..9)");
             const o = f.offset;
             if (!Number.isInteger(o) || o < 0) fail("R_BAD_OFFSET", "field '" + f.name + "' has a bad offset " + o);
             if (name.has(f.name)) fail("R_DUPLICATE_FIELD", "duplicate field name '" + f.name + "'");
@@ -281,7 +300,7 @@ export class LiteBinaryReader {
         // is a normal answer, not an error.
         const lanes = new Array(n).fill(null);
         if (this._le === IS_LITTLE_ENDIAN) {
-            const views = [null, null, null, null, null, null, null, null];
+            const views = [null, null, null, null, null, null, null, null, null, null];
             for (let i = 0; i < n; i++) {
                 const t = this._type[i];
                 const width = TYPE_BYTES[t];
@@ -359,6 +378,11 @@ export class LiteBinaryReader {
     getI8(row, fieldId) { return this._dv.getInt8(this._base + row * this._stride + this._off[fieldId]); }
     getU8(row, fieldId) { return this._dv.getUint8(this._base + row * this._stride + this._off[fieldId]); }
 
+    // 64-bit lanes (S9). These return a BigInt and therefore ALLOCATE (a BigInt is
+    // a heap value by spec) -- they are NOT on the zero-GC read path, by design.
+    getI64(row, fieldId) { return this._dv.getBigInt64(this._base + row * this._stride + this._off[fieldId], this._le); }
+    getU64(row, fieldId) { return this._dv.getBigUint64(this._base + row * this._stride + this._off[fieldId], this._le); }
+
     /** Generic read: dispatches on the field's stored type code. One branch per
      *  read -- use the typed getX above in a tight monomorphic loop; use this
      *  when the type is data-driven (mixed schema walk, debug, tooling). */
@@ -373,6 +397,8 @@ export class LiteBinaryReader {
             case T_I16: return dv.getInt16(pos, le);
             case T_U16: return dv.getUint16(pos, le);
             case T_I8:  return dv.getInt8(pos);
+            case T_I64: return dv.getBigInt64(pos, le);  // allocates a BigInt (S9)
+            case T_U64: return dv.getBigUint64(pos, le); // allocates a BigInt (S9)
             default:    return dv.getUint8(pos); // T_U8
         }
     }
@@ -413,6 +439,9 @@ export class LiteBinaryReader {
     u16(id) { return this._dv.getUint16(this._base + this._cursor * this._stride + this._off[id], this._le); }
     i8(id) { return this._dv.getInt8(this._base + this._cursor * this._stride + this._off[id]); }
     u8(id) { return this._dv.getUint8(this._base + this._cursor * this._stride + this._off[id]); }
+    // 64-bit cursor reads (S9). Return a BigInt -> allocate, NOT on the zero-GC path.
+    i64(id) { return this._dv.getBigInt64(this._base + this._cursor * this._stride + this._off[id], this._le); }
+    u64(id) { return this._dv.getBigUint64(this._base + this._cursor * this._stride + this._off[id], this._le); }
 
     /** Generic cursor read: the `get` switch over `_cursor`. */
     val(id) {
@@ -426,6 +455,8 @@ export class LiteBinaryReader {
             case T_I16: return dv.getInt16(pos, le);
             case T_U16: return dv.getUint16(pos, le);
             case T_I8:  return dv.getInt8(pos);
+            case T_I64: return dv.getBigInt64(pos, le);  // allocates a BigInt (S9)
+            case T_U64: return dv.getBigUint64(pos, le); // allocates a BigInt (S9)
             default:    return dv.getUint8(pos); // T_U8
         }
     }
@@ -437,6 +468,9 @@ export class LiteBinaryReader {
      * i in [0,fieldCount). Cold door: refuse a sink that cannot hold one row -- an
      * Array too short would auto-GROW (an allocation), a TypedArray too short
      * would silently drop cells. Reuses R_BAD_LENGTH (no new code). Returns `out`.
+     * S9 note: a mixed 64-bit row yields `number | bigint` cells, so a `Float64Array`
+     * (or any numeric TypedArray) sink THROWS when a 64-bit cell is written -- use an
+     * `Array` sink (or a `BigInt64Array` sink for an all-64-bit row).
      */
     readRow(row, out) {
         if (out == null || typeof out.length !== "number" || out.length < this._fieldCount) {
@@ -453,6 +487,8 @@ export class LiteBinaryReader {
                 case T_I16: out[i] = dv.getInt16(p, le); break;
                 case T_U16: out[i] = dv.getUint16(p, le); break;
                 case T_I8:  out[i] = dv.getInt8(p); break;
+                case T_I64: out[i] = dv.getBigInt64(p, le); break;  // allocates a BigInt (S9)
+                case T_U64: out[i] = dv.getBigUint64(p, le); break; // allocates a BigInt (S9)
                 default:    out[i] = dv.getUint8(p); // T_U8
             }
         }

@@ -4,7 +4,8 @@
  * t0/t5 fuzz VALUES and (row,field) READS over a FIXED schema; t1 hand-writes a
  * few degenerate layouts. Neither fuzzes the SCHEMA SPACE. This tier draws
  * thousands of RANDOM LEGAL schemas -- random field count, a random subset/order
- * of the 8 type codes, random inter-field padding (so offsets are arbitrary and
+ * of the 10 type codes (8/9 = the S9 64-bit BigInt lanes), random inter-field
+ * padding (so offsets are arbitrary and
  * often unaligned), a random tail pad on the stride, and LE or BE at random --
  * builds a reader plus a reference DataView from the SAME random layout, and
  * asserts every read agrees cell-for-cell (Object.is, so NaN/-0 cannot slip).
@@ -12,8 +13,10 @@
  * (base + row*stride + offset, per-field width, derived count) is what this
  * exercises that the fixed-schema tiers cannot.
  *
- * Non-vacuity is asserted: the draws must span all 8 lanes AND both endiannesses,
+ * Non-vacuity is asserted: the draws must span all 10 lanes AND both endiannesses,
  * and a deliberate wrong-offset control must DIVERGE (the equality has teeth).
+ * A 64-bit (BigInt) cell cannot be stored in a Float64Array sink, so a schema that
+ * carries any 64-bit lane uses an Array readRow sink (never a Float64Array).
  */
 
 import { LiteBinaryReader } from '../../Reader.js';
@@ -29,7 +32,7 @@ export async function run() {
   const prng = makePrng(SEED);
   const rnd = (n) => prng() % n;
 
-  const lanesSeen = new Array(8).fill(false);
+  const lanesSeen = new Array(10).fill(false);
   const endianSeen = { true: false, false: false };
   let comparisons = 0;
   let rrCells = 0;
@@ -41,12 +44,14 @@ export async function run() {
     const nFields = 1 + rnd(MAX_FIELDS);
     const schema = [];
     let cursor = 0;
+    let has64 = false;                      // any T_I64/T_U64 lane -> BigInt cells
     for (let k = 0; k < nFields; k++) {
-      const type = rnd(8);                 // 0..7, any lane, repeats allowed (names differ)
+      const type = rnd(10);                // 0..9, any lane (8/9 = 64-bit), repeats allowed (names differ)
       cursor += rnd(MAX_PAD + 1);          // random pre-pad -> arbitrary, often unaligned offset
       schema.push({ name: 'f' + k, type, offset: cursor });
       cursor += TYPE_BYTES[type];
       lanesSeen[type] = true;
+      if (type >= 8) has64 = true;
     }
     const stride = cursor + rnd(MAX_PAD + 1);   // >= largest field end, plus a random tail pad
     const le = rnd(2) === 1;
@@ -88,22 +93,25 @@ export async function run() {
     // must survive into an Array AND a Float64Array sink identically.
     {
       const row = rnd(count);
-      const sink = (s & 1) ? rrArr : rrF64;
+      // A 64-bit (BigInt) cell throws when written to a Float64Array, so any schema
+      // carrying a 64-bit lane MUST use the Array sink; otherwise alternate sinks.
+      const useArr = has64 || (s & 1);
+      const sink = useArr ? rrArr : rrF64;
       const ret = reader.readRow(row, sink);
       check(ret === sink, () => 't8: readRow did not return its sink (seed ' + SEED + ', draw ' + s + ')');
       for (let i = 0; i < nFields; i++) {
         const want = oracleRead(refDv, schema[i].type, row * stride + schema[i].offset, le);
         check(Object.is(sink[i], want), () => 't8: readRow MISMATCH field ' + i + ' type ' +
           schema[i].type + ' row ' + row + ' -> got ' + sink[i] + ' want ' + want +
-          ' (' + ((s & 1) ? 'Array' : 'Float64Array') + ' sink, off ' + schema[i].offset +
+          ' (' + (useArr ? 'Array' : 'Float64Array') + ' sink, off ' + schema[i].offset +
           ', le ' + le + ', seed ' + SEED + ', draw ' + s + ')');
         rrCells++;
       }
     }
   }
 
-  // --- non-vacuity: the draws must have spanned all 8 lanes and both endiannesses
-  for (let t = 0; t < 8; t++) {
+  // --- non-vacuity: the draws must have spanned all 10 lanes and both endiannesses
+  for (let t = 0; t < 10; t++) {
     check(lanesSeen[t], () => 't8: lane type ' + t + ' never exercised -- fuzz coverage gap');
   }
   check(endianSeen.true && endianSeen.false, () => 't8: not both endiannesses exercised');
