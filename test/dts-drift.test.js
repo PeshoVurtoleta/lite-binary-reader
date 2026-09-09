@@ -133,6 +133,13 @@ test('(a) code-union parity: fail() R_* codes === ReaderErrorCode union', () => 
   const diffs = setDiff(failCodes(JS), unionCodes(DTS), 'Reader.js', 'Reader.d.ts union');
   assert.deepEqual(diffs, [], diffs.join('; '));
   assert.equal(failCodes(JS).size, 10, 'the R_* union must stay exactly 10 codes');
+  // The type-code table is a frozen invariant too: TYPE_COUNT and the TYPE_BYTES
+  // width table must both stay at exactly 8 (S4 adds no new type code).
+  assert.match(JS, /const TYPE_COUNT = 8;/, 'TYPE_COUNT must stay exactly 8');
+  const tbMatch = /const TYPE_BYTES = \[([^\]]*)\]/.exec(JS);
+  assert.ok(tbMatch, 'Reader.js has no TYPE_BYTES table');
+  const entries = tbMatch[1].split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+  assert.equal(entries.length, 8, 'TYPE_BYTES must have exactly 8 entries, saw ' + entries.length);
 });
 
 test('(b) export parity: value exports agree + class members present in both', () => {
@@ -144,7 +151,7 @@ test('(b) export parity: value exports agree + class members present in both', (
   // clean inventory and must not declare surface the source lacks.)
   const jsMembers = classMembers(JS, 'LiteBinaryReader');
   const dtsMembers = classMembers(DTS, 'LiteBinaryReader');
-  assert.ok(dtsMembers.size >= 20, 'expected the d.ts to declare the full member surface, saw ' + dtsMembers.size);
+  assert.ok(dtsMembers.size >= 31, 'expected the d.ts to declare the full member surface, saw ' + dtsMembers.size);
   const memberMissing = [];
   for (const nm of dtsMembers) if (!jsMembers.has(nm)) memberMissing.push('Reader.d.ts declares member ' + nm + ' absent from Reader.js');
   assert.deepEqual(memberMissing, [], memberMissing.join('; '));

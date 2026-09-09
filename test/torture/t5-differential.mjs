@@ -63,6 +63,36 @@ export async function run() {
         ' got=' + got + ' oracle=' + oracle + ' (seed=' + SEED + ')');
   }
 
+  // --- Oracle D: the row cursor reads identically to the DataView oracle (A9) --
+  // seek(row) then the type-matched cursor read must equal oracleRead cell-for-
+  // cell over 100k random (row,fid). The cursor INLINES the getX arithmetic with
+  // _cursor substituted for row, so any divergence here is a cursor-address bug.
+  {
+    const cprng = makePrng((SEED ^ 0x5bd1e995) >>> 0 || 1);
+    for (let k = 0; k < READS; k++) {
+      const row = cprng() % COUNT;
+      const fid = cprng() % SCHEMA.length;
+      const t = SCHEMA[fid].type;
+      const pos = base + row * STRIDE + SCHEMA[fid].offset;
+      const oracle = oracleRead(dv, t, pos, true);
+      reader.seek(row);
+      let got;
+      switch (t) {
+        case 1: got = reader.f64(fid); break;
+        case 0: got = reader.f32(fid); break;
+        case 2: got = reader.i32(fid); break;
+        case 5: got = reader.u32(fid); break;
+        case 3: got = reader.i16(fid); break;
+        case 6: got = reader.u16(fid); break;
+        case 4: got = reader.i8(fid); break;
+        default: got = reader.u8(fid);
+      }
+      check(Object.is(got, oracle),
+        () => 't5 oracle D (cursor) diverged at k=' + k + ' row=' + row + ' fid=' + fid +
+          ' got=' + got + ' oracle=' + oracle + ' (seed=' + SEED + ')');
+    }
+  }
+
   // --- Oracle B: an emulated lite-bake buffer (NATIVE endianness) --------------
   // lite-bake writes native order with no marker; fromBaked reads native. Prove
   // every cell equals a direct native DataView read.

@@ -28,6 +28,7 @@ export declare interface Field {
   name: string | number;
   type: TypeCode;
   offset: number;
+  lengthField?: string | number;
 }
 
 export declare interface Options {
@@ -86,6 +87,18 @@ export declare class LiteBinaryReader {
   getI8(row: number, fieldId: number): number;
   getU8(row: number, fieldId: number): number;
   get(row: number, fieldId: number): number;
+  seek(row: number): this;
+  f64(fieldId: number): number;
+  f32(fieldId: number): number;
+  i32(fieldId: number): number;
+  u32(fieldId: number): number;
+  i16(fieldId: number): number;
+  u16(fieldId: number): number;
+  i8(fieldId: number): number;
+  u8(fieldId: number): number;
+  val(fieldId: number): number;
+  readRow(row: number, out: { length: number; [i: number]: number }): { length: number; [i: number]: number };
+  bytes(row: number, fieldId: number): Uint8Array;
   bytes(row: number, fieldId: number, len: number): Uint8Array;
   static fromBaked(baked: Baked, options?: Options): LiteBinaryReader;
   static fromLBK1Shard(shard: Shard, options?: Options): LiteBinaryReader;

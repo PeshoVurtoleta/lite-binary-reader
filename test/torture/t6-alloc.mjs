@@ -46,6 +46,8 @@ const leak = [];
 
 // Hoisted so the hot body closes over primitives/views, never allocates.
 const sink = new Float64Array(1);
+// Module-hoisted readRow sink -- reused across every measured call (Gate 3).
+const rowOut = new Array(8);
 
 export async function run() {
   const buf = new ArrayBuffer(STRIDE * COUNT);
@@ -108,5 +110,50 @@ export async function run() {
       ' settled=' + g1b.result.settled +
       ' bytesPerCall=' + g1b.bytesPerCall +
       ' violations=' + g1b.report.violations.length);
+  }
+
+  // --- Gate 2: the row cursor (seek + 8 typed cursor reads + val) --------------
+  // Its OWN ops window AND retained-alloc window, strictly sequential (never
+  // nested -- lite-gc-profiler is one-measurement-at-a-time). seek writes a Smi
+  // cursor and each read inlines the getX arithmetic: zero allocation.
+  const cursorHot = (i) => {
+    const idx = i & MASK;
+    reader.seek(idx);
+    sink[0] += reader.f64(0) + reader.f32(1) + reader.i32(2) + reader.u32(3) +
+      reader.i16(4) + reader.u16(5) + reader.i8(6) + reader.u8(7) + reader.val(0);
+  };
+  const g2 = runOpsGate(cursorHot, { ops: OPS, warmup: WARMUP });
+  check(reader.buffer.byteLength === bufBytesBefore,
+    () => 'T6 Gate 2: buffer.byteLength changed ' + bufBytesBefore + ' -> ' + reader.buffer.byteLength);
+  check(reader._dv === dvBefore, () => 'T6 Gate 2: the DataView (_dv) was reallocated across the cursor window');
+  if (!g2.report.ok) {
+    const g = g2.summary.gc;
+    die('T6 Gate 2 (cursor) ops gate rejected -- verdict=' + g2.report.verdict +
+      ' source=' + g2.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+  }
+  const g2a = runAllocsGate(cursorHot, { iterations: 50000, batches: 8 });
+  if (!g2a.ok) {
+    die('T6 Gate 2 (cursor) retained-alloc gate rejected -- verdict=' + g2a.report.verdict +
+      ' settled=' + g2a.result.settled + ' bytesPerCall=' + g2a.bytesPerCall);
+  }
+
+  // --- Gate 3: readRow into a module-hoisted, reused out array -----------------
+  // Same two-window discipline. The caller owns `rowOut`; readRow allocates
+  // nothing and must never grow it.
+  const readRowHot = (i) => { reader.readRow(i & MASK, rowOut); };
+  const g3 = runOpsGate(readRowHot, { ops: OPS, warmup: WARMUP });
+  check(reader.buffer.byteLength === bufBytesBefore,
+    () => 'T6 Gate 3: buffer.byteLength changed ' + bufBytesBefore + ' -> ' + reader.buffer.byteLength);
+  check(reader._dv === dvBefore, () => 'T6 Gate 3: the DataView (_dv) was reallocated across the readRow window');
+  check(rowOut.length === 8, () => 'T6 Gate 3: readRow grew the out array to ' + rowOut.length);
+  if (!g3.report.ok) {
+    const g = g3.summary.gc;
+    die('T6 Gate 3 (readRow) ops gate rejected -- verdict=' + g3.report.verdict +
+      ' source=' + g3.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+  }
+  const g3a = runAllocsGate(readRowHot, { iterations: 50000, batches: 8 });
+  if (!g3a.ok) {
+    die('T6 Gate 3 (readRow) retained-alloc gate rejected -- verdict=' + g3a.report.verdict +
+      ' settled=' + g3a.result.settled + ' bytesPerCall=' + g3a.bytesPerCall);
   }
 }

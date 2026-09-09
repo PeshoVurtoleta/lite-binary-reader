@@ -31,8 +31,128 @@ function assertCode(fn, code) {
     'expected a LiteBinaryReaderError with code ' + code);
 }
 
-test('VERSION is the shipped v0.2.0 string', () => {
-  assert.equal(VERSION, '0.2.0');
+test('VERSION is the shipped v0.3.0 string', () => {
+  assert.equal(VERSION, '0.3.0');
+});
+
+// --- S4 (v0.3.0): the cursor, readRow, and variable-length surfaces ----------
+
+/** An 8-field, one-per-type schema + a filled buffer of `rows` records. */
+function eightFieldFixture(rows) {
+  const schema = [
+    { name: 'f64', type: T_F64, offset: 0 },
+    { name: 'f32', type: T_F32, offset: 8 },
+    { name: 'i32', type: T_I32, offset: 12 },
+    { name: 'u32', type: T_U32, offset: 16 },
+    { name: 'i16', type: T_I16, offset: 20 },
+    { name: 'u16', type: T_U16, offset: 22 },
+    { name: 'i8', type: T_I8, offset: 24 },
+    { name: 'u8', type: T_U8, offset: 25 },
+  ];
+  const stride = 26;
+  const buf = new ArrayBuffer(stride * rows);
+  const dv = new DataView(buf);
+  for (let r = 0; r < rows; r++) {
+    const b = r * stride;
+    dv.setFloat64(b + 0, r * 2.5 - 7.25, true);
+    dv.setFloat32(b + 8, r * 0.5 + 0.125, true);
+    dv.setInt32(b + 12, r - 32, true);
+    dv.setUint32(b + 16, (r * 2654435761) >>> 0, true);
+    dv.setInt16(b + 20, r - 300, true);
+    dv.setUint16(b + 22, (r * 777) & 0xffff, true);
+    dv.setInt8(b + 24, (r & 0xff) - 100);
+    dv.setUint8(b + 25, (r + 7) & 0xff);
+  }
+  return { schema, buf, stride };
+}
+
+test('A1: seek(row).<type>(id) === getX(row,id) and val === get across all cells', () => {
+  const { schema, buf } = eightFieldFixture(64);
+  const rd = new LiteBinaryReader(buf, { schema });
+  assert.equal(rd.seek(3), rd); // chainable: seek returns this
+  const cursor = [rd.f64, rd.f32, rd.i32, rd.u32, rd.i16, rd.u16, rd.i8, rd.u8];
+  const typed = [rd.getF64, rd.getF32, rd.getI32, rd.getU32, rd.getI16, rd.getU16, rd.getI8, rd.getU8];
+  let cells = 0;
+  for (let r = 0; r < 64; r++) {
+    for (let f = 0; f < 8; f++) {
+      rd.seek(r);
+      assert.ok(Object.is(cursor[f].call(rd, f), typed[f].call(rd, r, f)), 'cursor typed mismatch r=' + r + ' f=' + f);
+      assert.equal(rd.seek(r).val(f), rd.get(r, f));
+      cells++;
+    }
+  }
+  assert.equal(cells, 512);
+});
+
+test('A2: readRow fills out[i]===get(r,i) into a reused Array and a Float64Array sink', () => {
+  const { schema, buf } = eightFieldFixture(64);
+  const rd = new LiteBinaryReader(buf, { schema });
+  for (const makeSink of [() => new Array(8), () => new Float64Array(8)]) {
+    const out = makeSink();
+    for (let r = 0; r < 64; r++) {
+      const ret = rd.readRow(r, out);
+      assert.equal(ret, out); // returns the same sink
+      for (let i = 0; i < 8; i++) assert.ok(out[i] === rd.get(r, i), 'readRow cell mismatch r=' + r + ' i=' + i);
+      assert.equal(out.length, 8); // never grew
+    }
+  }
+});
+
+test('A3: readRow refuses a too-short / non-indexable sink with R_BAD_LENGTH', () => {
+  const { schema, buf } = eightFieldFixture(4);
+  const rd = new LiteBinaryReader(buf, { schema });
+  assertCode(() => rd.readRow(0, new Array(7)), 'R_BAD_LENGTH');
+  assertCode(() => rd.readRow(0, null), 'R_BAD_LENGTH');
+  assertCode(() => rd.readRow(0, {}), 'R_BAD_LENGTH');
+  assert.doesNotThrow(() => rd.readRow(0, new Array(8)));
+});
+
+test('A4: variable-length bytes(row,id) via a lengthField sibling', () => {
+  const schema = [
+    { name: 'len', type: T_U32, offset: 0 },
+    { name: 'blob', type: T_U8, offset: 4, lengthField: 'len' },
+  ];
+  const stride = 16, rows = 4;
+  const buf = new ArrayBuffer(stride * rows);
+  const dv = new DataView(buf);
+  const u8 = new Uint8Array(buf);
+  for (let r = 0; r < rows; r++) {
+    const b = r * stride;
+    const len = r + 1; // 1..4, fits inside the stride
+    dv.setUint32(b + 0, len, true);
+    for (let k = 0; k < len; k++) u8[b + 4 + k] = (r * 16 + k + 1) & 0xff;
+  }
+  const rd = new LiteBinaryReader(buf, { schema, stride });
+  for (let r = 0; r < rows; r++) {
+    const len = r + 1;
+    const auto = rd.bytes(r, 1);
+    assert.equal(auto.length, len);
+    assert.deepEqual(Array.from(auto), Array.from(rd.bytes(r, 1, len)));
+  }
+  // Door: a length cell of 0xFFFFFFFF overruns the buffer -> R_BUFFER_TOO_SMALL.
+  const bigBuf = new ArrayBuffer(16);
+  new DataView(bigBuf).setUint32(0, 0xffffffff, true);
+  const bigRd = new LiteBinaryReader(bigBuf, { schema, count: 1 });
+  assertCode(() => bigRd.bytes(0, 1), 'R_BUFFER_TOO_SMALL');
+  // Door: an F64 length source holding 3.5 is not an integer -> R_BAD_LENGTH.
+  const fSchema = [
+    { name: 'len', type: T_F64, offset: 0 },
+    { name: 'blob', type: T_U8, offset: 8, lengthField: 'len' },
+  ];
+  const fBuf = new ArrayBuffer(16);
+  new DataView(fBuf).setFloat64(0, 3.5, true);
+  const fRd = new LiteBinaryReader(fBuf, { schema: fSchema, count: 1 });
+  assertCode(() => fRd.bytes(0, 1), 'R_BAD_LENGTH');
+  // Door: 2-arg bytes() on a field without a lengthField -> R_BAD_LENGTH.
+  assertCode(() => rd.bytes(0, 0), 'R_BAD_LENGTH');
+  // Construction door: an unknown lengthField NAME -> R_UNKNOWN_FIELD.
+  assertCode(() => new LiteBinaryReader(new ArrayBuffer(16), {
+    schema: [{ name: 'len', type: T_U32, offset: 0 }, { name: 'blob', type: T_U8, offset: 4, lengthField: 'nope' }],
+  }), 'R_UNKNOWN_FIELD');
+  // Construction door: a self-referencing lengthField -> R_BAD_SCHEMA.
+  assertCode(() => new LiteBinaryReader(new ArrayBuffer(16), {
+    schema: [{ name: 'len', type: T_U32, offset: 0 }, { name: 'blob', type: T_U8, offset: 4, lengthField: 'blob' }],
+  }), 'R_BAD_SCHEMA');
 });
 
 test('every getX reads its type bit-exact against a DataView (LE)', () => {
@@ -462,4 +582,263 @@ test('BR-09: a DataView over a LIVE buffer constructs normally (full-span, zero-
   const rd = new LiteBinaryReader(new DataView(buf), { schema });
   assert.equal(rd.count, 8);
   assert.equal(rd.getF64(0, 0), 42.5);
+});
+
+// =============================================================================
+// QA S4 -- hole hunt: the cursor / readRow / 2-arg bytes surfaces share _dv,
+// _base and _stride with getX BY CONSTRUCTION only if the address arithmetic is
+// exercised beyond row 0. No test anywhere in test/Reader.test.js or
+// test/torture/*.mjs constructs a cursor/readRow/2-arg-bytes reader with a
+// NONZERO byteOffset -- every A1/A2/A4 fixture and t5 Oracle D / t9 control 11
+// use byteOffset 0. A missing `_base` term in one of the three new address
+// expressions would pass row 0 (base cancels out arithmetically when base===0)
+// and only diverge from row 1 onward -- exactly the BR-09-class blind spot the
+// existing matrix never crossed. These tests close that gap.
+// =============================================================================
+
+test('QA-S4a: seek/readRow/2-arg-bytes agree with getX/get at a NONZERO base, every row', () => {
+  const schema = [
+    { name: 'len', type: T_U32, offset: 0 },
+    { name: 'f64', type: T_F64, offset: 4 },
+    { name: 'blob', type: T_U8, offset: 12, lengthField: 'len' },
+  ];
+  const stride = 20, rows = 6, base = 37; // an odd, non-tidy base on purpose
+  const buf = new ArrayBuffer(base + stride * rows + 5); // trailing slack too
+  const dv = new DataView(buf);
+  const u8 = new Uint8Array(buf);
+  for (let r = 0; r < rows; r++) {
+    const b = base + r * stride;
+    const len = r; // 0..5, fits inside the stride's tail room
+    dv.setUint32(b + 0, len, true);
+    dv.setFloat64(b + 4, r * -3.25 + 1.5, true);
+    for (let k = 0; k < len; k++) u8[b + 12 + k] = (r * 20 + k + 1) & 0xff;
+  }
+  const rd = new LiteBinaryReader(buf, { schema, stride, byteOffset: base, count: rows });
+  assert.equal(rd.count, rows);
+  for (let r = 0; r < rows; r++) {
+    // cursor vs getX/get, every row (not just row 0)
+    assert.ok(Object.is(rd.seek(r).u32(0), rd.getU32(r, 0)), 'cursor u32 mismatch at row ' + r);
+    assert.ok(Object.is(rd.seek(r).f64(1), rd.getF64(r, 1)), 'cursor f64 mismatch at row ' + r);
+    assert.equal(rd.seek(r).val(0), rd.get(r, 0));
+    // readRow vs get, every row
+    const out = new Array(3);
+    rd.readRow(r, out);
+    assert.ok(out[0] === rd.get(r, 0) && Object.is(out[1], rd.get(r, 1)) && out[2] === rd.get(r, 2),
+      'readRow mismatch at row ' + r);
+    // 2-arg bytes lands at base + r*stride + off, every row
+    const len = r;
+    const v = rd.bytes(r, 2);
+    assert.equal(v.length, len);
+    for (let k = 0; k < len; k++) assert.equal(v[k], (r * 20 + k + 1) & 0xff);
+  }
+});
+
+test('QA-S4b: partial/offset-view (BR-07 class) reader -- cursor, readRow, 2-arg bytes stay in-window', () => {
+  const pool = new Uint8Array(96);
+  pool.fill(0xee); // poison outside the reader's window
+  const winStart = 24, winLen = 40; // an offset AND partial view (not full-span)
+  const stride = 20, rows = 2;
+  const dvPool = new DataView(pool.buffer);
+  for (let r = 0; r < rows; r++) {
+    const b = winStart + r * stride;
+    dvPool.setUint32(b + 0, r + 1, true); // len
+    dvPool.setFloat64(b + 4, r * 9.5 - 1, true);
+    for (let k = 0; k <= r; k++) pool[b + 12 + k] = (r * 5 + k + 9) & 0xff;
+  }
+  const schema = [
+    { name: 'len', type: T_U32, offset: 0 },
+    { name: 'f64', type: T_F64, offset: 4 },
+    { name: 'blob', type: T_U8, offset: 12, lengthField: 'len' },
+  ];
+  const view = new Uint8Array(pool.buffer, winStart, winLen); // offset + partial
+  const rd = new LiteBinaryReader(view, { schema, stride, count: rows });
+  // resolved buffer is exactly the window: no poison bytes are reachable at all
+  assert.equal(rd.buffer.byteLength, winLen);
+  assert.notEqual(rd.buffer, pool.buffer);
+  for (let r = 0; r < rows; r++) {
+    assert.ok(Object.is(rd.seek(r).u32(0), rd.getU32(r, 0)));
+    assert.ok(Object.is(rd.seek(r).f64(1), rd.getF64(r, 1)));
+    assert.equal(rd.getU32(r, 0), r + 1);
+    const out = new Array(3);
+    rd.readRow(r, out);
+    assert.ok(out[0] === rd.get(r, 0) && Object.is(out[1], rd.get(r, 1)));
+    const v = rd.bytes(r, 2);
+    assert.equal(v.length, r + 1);
+    for (let k = 0; k <= r; k++) assert.equal(v[k], (r * 5 + k + 9) & 0xff);
+    // the borrowed view aliases ONLY the copied window, never the poisoned pool
+    assert.equal(v.buffer, rd.buffer);
+  }
+});
+
+test('QA-S4c: lengthField edge values -- negative I32, exact-boundary success, one-past failure, -0', () => {
+  // A negative I32 length source -> R_BAD_LENGTH (len < 0).
+  {
+    const schema = [{ name: 'len', type: T_I32, offset: 0 }, { name: 'blob', type: T_U8, offset: 4, lengthField: 'len' }];
+    const buf = new ArrayBuffer(16);
+    new DataView(buf).setInt32(0, -1, true);
+    const rd = new LiteBinaryReader(buf, { schema, count: 1 });
+    assertCode(() => rd.bytes(0, 1), 'R_BAD_LENGTH');
+  }
+  // A length that lands the span EXACTLY at the buffer end must SUCCEED; one
+  // byte more must throw R_BUFFER_TOO_SMALL (the boundary is precise, not off-by-one).
+  {
+    const schema = [{ name: 'len', type: T_U32, offset: 0 }, { name: 'blob', type: T_U8, offset: 4, lengthField: 'len' }];
+    const buf = new ArrayBuffer(20); // blob starts at 4, so a span of 16 ends exactly at 20
+    const rd = new LiteBinaryReader(buf, { schema, stride: 20, count: 1 });
+    const dv = new DataView(buf);
+    dv.setUint32(0, 16, true);
+    assert.equal(rd.bytes(0, 1).length, 16);
+    dv.setUint32(0, 17, true);
+    assertCode(() => rd.bytes(0, 1), 'R_BUFFER_TOO_SMALL');
+  }
+  // An F64 length source holding -0: Number.isInteger(-0) is true and -0 >= 0,
+  // so the door accepts it as a valid (zero-length) span -- document the value.
+  {
+    const schema = [{ name: 'len', type: T_F64, offset: 0 }, { name: 'blob', type: T_U8, offset: 8, lengthField: 'len' }];
+    const buf = new ArrayBuffer(16);
+    new DataView(buf).setFloat64(0, -0, true);
+    const rd = new LiteBinaryReader(buf, { schema, count: 1 });
+    const v = rd.bytes(0, 1);
+    assert.equal(v.length, 0);
+  }
+});
+
+test('QA-S4d: 2-arg bytes() with an out-of-contract row fails CLOSED (throws, never returns a view)', () => {
+  const schema = [{ name: 'len', type: T_U32, offset: 0 }, { name: 'blob', type: T_U8, offset: 4, lengthField: 'len' }];
+  const buf = new ArrayBuffer(16);
+  new DataView(buf).setUint32(0, 4, true);
+  const rd = new LiteBinaryReader(buf, { schema, count: 1 });
+  for (const badRow of [1000000, -1, -1000]) {
+    let threw = null;
+    let result;
+    try { result = rd.bytes(badRow, 1); } catch (e) { threw = e; }
+    assert.equal(result, undefined, 'bytes(' + badRow + ',1) returned a value instead of throwing');
+    assert.ok(threw instanceof Error, 'bytes(' + badRow + ',1) did not throw at all');
+    // Per the brief, a per-read row bounds check is a NON-GOAL: a raw RangeError
+    // (uncoded) is acceptable here. What is NOT acceptable is silently returning
+    // a view over memory outside the buffer -- confirmed above by `result` staying
+    // undefined on every throwing path.
+  }
+});
+
+test('QA-S4e: readRow TOCTOU -- a hostile `out.length` getter cannot cause a short write or read-past', () => {
+  const schema = [{ name: 'a', type: T_U32, offset: 0 }, { name: 'b', type: T_U8, offset: 4 }];
+  const stride = 16, rows = 2;
+  const buf = new ArrayBuffer(stride * rows);
+  const dv = new DataView(buf);
+  dv.setUint32(0, 111, true); dv.setUint8(4, 1);
+  dv.setUint32(stride, 222, true); dv.setUint8(stride + 4, 2);
+  const rd = new LiteBinaryReader(buf, { schema, stride });
+
+  // Case 1: the getter reports a length >= fieldCount on EVERY read (never lies
+  // downward) -- the fill loop must still bind on this._fieldCount, not on a
+  // fresh out.length read, so a length that later balloons cannot cause the loop
+  // to write past fieldCount cells either.
+  {
+    let lengthReads = 0;
+    const writes = [];
+    const backing = [];
+    const hostile = new Proxy(backing, {
+      get(target, prop, recv) {
+        if (prop === 'length') { lengthReads++; return 1000; } // always "huge"
+        return Reflect.get(target, prop, recv);
+      },
+      set(target, prop, value, recv) {
+        writes.push(String(prop));
+        return Reflect.set(target, prop, value, recv);
+      },
+    });
+    const ret = rd.readRow(0, hostile);
+    assert.equal(ret, hostile);
+    assert.deepEqual(writes.sort(), ['0', '1'], 'readRow wrote a different index set than [0,1] (' + writes + ')');
+    assert.equal(backing[0], rd.get(0, 0));
+    assert.equal(backing[1], rd.get(0, 1));
+    assert.ok(lengthReads >= 1, 'the door never read out.length at all');
+  }
+
+  // Case 2: the getter passes the door once (length >= fieldCount) and then
+  // reports a too-short length on every subsequent read. Since the fill loop
+  // never re-reads out.length (it binds n = this._fieldCount ONCE, before the
+  // loop), this can never manifest as a partial/short write -- prove it doesn't.
+  {
+    let calls = 0;
+    const backing = new Array(2);
+    const hostile = new Proxy(backing, {
+      get(target, prop, recv) {
+        if (prop === 'length') { calls++; return calls <= 2 ? 2 : 0; } // shrinks after the door
+        return Reflect.get(target, prop, recv);
+      },
+    });
+    const ret = rd.readRow(1, hostile);
+    assert.equal(ret, hostile);
+    assert.equal(backing[0], rd.get(1, 0));
+    assert.equal(backing[1], rd.get(1, 1));
+  }
+
+  // Case 3: a sink that is rejected at the door (length shrinks to below
+  // fieldCount on the SECOND read, so the door itself throws) must leave NO
+  // partial fill behind -- the door runs entirely before the first write.
+  {
+    let calls = 0;
+    const backing = ['untouched', 'untouched'];
+    const hostile = new Proxy(backing, {
+      get(target, prop, recv) {
+        if (prop === 'length') { calls++; return calls === 1 ? 2 : 0; } // passes typeof check, fails the size check
+        return Reflect.get(target, prop, recv);
+      },
+    });
+    assertCode(() => rd.readRow(0, hostile), 'R_BAD_LENGTH');
+    assert.deepEqual(backing, ['untouched', 'untouched'], 'a door-rejected sink was partially written before the throw');
+  }
+});
+
+test('QA-S4f: readRow is reentrancy-safe -- a write-trap that calls back into readRow does not corrupt the outer fill', () => {
+  const schema = [{ name: 'a', type: T_U32, offset: 0 }, { name: 'b', type: T_U8, offset: 4 }];
+  const stride = 16, rows = 2;
+  const buf = new ArrayBuffer(stride * rows);
+  const dv = new DataView(buf);
+  dv.setUint32(0, 111, true); dv.setUint8(4, 1);
+  dv.setUint32(stride, 222, true); dv.setUint8(stride + 4, 2);
+  const rd = new LiteBinaryReader(buf, { schema, stride });
+  const out = new Array(2);
+  let reentered = false;
+  const proxy = new Proxy(out, {
+    set(target, prop, value, recv) {
+      if (!reentered && prop === '0') {
+        reentered = true;
+        const otherOut = new Array(2);
+        rd.readRow(1, otherOut); // reentrant call, mid-fill, on the SAME reader
+        assert.equal(otherOut[0], 222);
+        assert.equal(otherOut[1], 2);
+      }
+      return Reflect.set(target, prop, value, recv);
+    },
+  });
+  rd.readRow(0, proxy);
+  // readRow has no shared mutable loop state (row is a parameter, pos/n/i are
+  // locals per call) -- the outer fill for row 0 must be intact after the
+  // reentrant row-1 call completed inside the write trap.
+  assert.equal(out[0], 111);
+  assert.equal(out[1], 1);
+});
+
+test('QA-S4g: seek/getX stay symmetric even on a garbage row (NaN/undefined/null/-0) -- unchecked-by-design, but never diverging', () => {
+  // seek()/getX are BOTH unchecked by contract (BRIEF T1); DataView's ToIndex
+  // coerces NaN/undefined/null to 0, so a garbage row silently reads row 0
+  // rather than throwing on EITHER surface. This is a pre-existing (v0.2.0)
+  // getX behaviour, not new to S4 -- the adversarial question is whether the
+  // NEW cursor surface stays byte-identical to getX under the same garbage
+  // input, or whether it (wrongly) diverges/throws differently.
+  const schema = [{ name: 'x', type: T_U32, offset: 0 }];
+  const buf = new ArrayBuffer(32);
+  new DataView(buf).setUint32(0, 0xdeadbeef >>> 0, true);
+  const rd = new LiteBinaryReader(buf, { schema, stride: 8, count: 4 });
+  for (const bad of [NaN, undefined, null, -0]) {
+    let cursorResult, cursorThrew = null;
+    try { cursorResult = rd.seek(bad).u32(0); } catch (e) { cursorThrew = e; }
+    let getXResult, getXThrew = null;
+    try { getXResult = rd.getU32(bad, 0); } catch (e) { getXThrew = e; }
+    assert.equal(cursorThrew, getXThrew, 'cursor/getX diverged on throw-ness for row=' + bad);
+    if (cursorThrew === null) assert.ok(Object.is(cursorResult, getXResult), 'cursor/getX diverged in value for row=' + bad);
+  }
 });

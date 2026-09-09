@@ -16,7 +16,7 @@
  *      IFF checkCoherence flags it -- the door <-> checkCoherence agreement.
  */
 
-import { LiteBinaryReader, T_F64, T_U8 } from '../../Reader.js';
+import { LiteBinaryReader, T_F64, T_U8, T_U32 } from '../../Reader.js';
 import { check, checkCoherence, validate } from './harness.mjs';
 
 /** Assert a constructor call throws a LiteBinaryReaderError with the given code. */
@@ -190,6 +190,56 @@ export async function run() {
   expectCode(() => LiteBinaryReader.fromLBK1Shard(null), 'R_BAD_SOURCE', 'BR-06 fromLBK1Shard(null)');
   expectCode(() => LiteBinaryReader.fromLBK1Shard({ bytes: new ArrayBuffer(8), rowStride: 8 }),
     'R_BAD_SCHEMA', 'BR-06 fromLBK1Shard fieldless');
+
+  // --- 3c. S4 (v0.3.0) boundary cases: readRow door + variable-length bytes ----
+  // NAMED cases only. checkCoherence does NOT model lengthField, so a lengthField
+  // dimension is deliberately kept OUT of the 2700-cell matrix below: adding one
+  // would break the throws-IFF-checkCoherence-flags agreement law (the matrix
+  // asserts the door and checkCoherence agree, and checkCoherence has no
+  // lengthField concept). These stand alone here instead.
+
+  // readRow door: a null / non-indexable / too-short sink is R_BAD_LENGTH; an
+  // exactly-fieldCount sink fills and returns itself (non-vacuity).
+  const rrSchema = [
+    { name: 'a', type: T_F64, offset: 0 },
+    { name: 'b', type: T_U8, offset: 8 },
+  ];
+  const rr = new LiteBinaryReader(new ArrayBuffer(9 * 4), { schema: rrSchema });
+  expectCode(() => rr.readRow(0, null), 'R_BAD_LENGTH', 'readRow null sink');
+  expectCode(() => rr.readRow(0, {}), 'R_BAD_LENGTH', 'readRow non-indexable sink');
+  expectCode(() => rr.readRow(0, new Array(1)), 'R_BAD_LENGTH', 'readRow too-short sink');
+  const rrOut = new Array(2);
+  check(rr.readRow(0, rrOut) === rrOut, () => 't2: readRow did not return its out sink');
+  check(rrOut[0] === rr.get(0, 0) && rrOut[1] === rr.get(0, 1), () => 't2: readRow filled cells wrong');
+  check(rrOut.length === 2, () => 't2: readRow grew the out sink to ' + rrOut.length);
+
+  // variable-length bytes(row,id): 2-arg equals 3-arg for the sibling value.
+  const vlSchema = [
+    { name: 'len', type: T_U32, offset: 0 },
+    { name: 'blob', type: T_U8, offset: 4, lengthField: 'len' },
+  ];
+  const vlBuf = new ArrayBuffer(16);
+  const vlDv = new DataView(vlBuf);
+  vlDv.setUint32(0, 5, true);
+  for (let k = 0; k < 5; k++) new Uint8Array(vlBuf)[4 + k] = k + 1;
+  const vl = new LiteBinaryReader(vlBuf, { schema: vlSchema, count: 1 });
+  const vlAuto = vl.bytes(0, 1);
+  check(vlAuto.length === 5, () => 't2: variable-length bytes() length ' + vlAuto.length + ' != 5');
+  const vlExplicit = vl.bytes(0, 1, 5);
+  for (let k = 0; k < 5; k++) check(vlAuto[k] === vlExplicit[k], () => 't2: 2-arg vs 3-arg bytes diverged at ' + k);
+  // a length past the buffer -> R_BUFFER_TOO_SMALL.
+  vlDv.setUint32(0, 0xffffffff, true);
+  expectCode(() => vl.bytes(0, 1), 'R_BUFFER_TOO_SMALL', 'variable-length overrun');
+  // a 2-arg bytes() on a field without a lengthField -> R_BAD_LENGTH.
+  expectCode(() => vl.bytes(0, 0), 'R_BAD_LENGTH', 'variable-length no lengthField');
+  // construction door: an unknown lengthField name -> R_UNKNOWN_FIELD.
+  expectCode(() => new LiteBinaryReader(vlBuf, {
+    schema: [{ name: 'len', type: T_U32, offset: 0 }, { name: 'blob', type: T_U8, offset: 4, lengthField: 'nope' }],
+  }), 'R_UNKNOWN_FIELD', 'variable-length unknown lengthField');
+  // construction door: a self-referencing lengthField -> R_BAD_SCHEMA.
+  expectCode(() => new LiteBinaryReader(vlBuf, {
+    schema: [{ name: 'len', type: T_U32, offset: 0 }, { name: 'blob', type: T_U8, offset: 4, lengthField: 'blob' }],
+  }), 'R_BAD_SCHEMA', 'variable-length self-reference');
 
   // --- 4. the full door matrix (ROADMAP section 4) ----------------------------
   // source {ArrayBuffer, full-span view, zero-offset PARTIAL view, offset view,

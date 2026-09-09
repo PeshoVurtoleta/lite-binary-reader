@@ -68,6 +68,8 @@ One `DataView`, any byte offset, endianness you choose, zero allocation on every
   - [The constructor](#the-constructor)
   - [Introspection](#introspection)
   - [The read hot path](#the-read-hot-path)
+  - [The row cursor](#the-row-cursor)
+  - [Row fill](#row-fill)
   - [The bytes escape hatch](#the-bytes-escape-hatch)
   - [Sibling cooperation](#sibling-cooperation)
   - [Type codes](#type-codes)
@@ -99,7 +101,9 @@ Existing options: hand-rolled `DataView` offset arithmetic (correct, but you re-
 - **`new LiteBinaryReader(source, options)`** -- the reader. `source` is an `ArrayBuffer` or any view (`TypedArray` or `DataView`); `options` is the `{ schema, stride?, count?, littleEndian?, byteOffset? }` layout. The constructor validates and compacts the schema into SoA tables, resolves the owned buffer, and freezes the shape. Build it once per `(source, layout)`; reuse it across the read loop.
   - **`getF64`..`getU8`(row, fieldId)** -- eight typed reads, one per type code. Each call site is monomorphic and branch-free: `reader.getF32(i, x)` pays no type switch.
   - **`get(row, fieldId)`** -- the generic read; dispatches on the field's stored type code (one branch). Reach for it when the type is data-driven (a mixed-schema walk, tooling, debug); reach for a typed `getX` in a tight loop.
-  - **`bytes(row, fieldId, len)`** -- a borrowed `Uint8Array` view over `len` raw bytes: the escape hatch for a blob or variable-length field. Copy what you keep.
+  - **`seek(row)` + `f64`..`u8`(fieldId) + `val(fieldId)`** -- a row cursor for sequential scans: seek a row once, then read its fields without re-passing the row. The cursor reads are the `getX` bodies with the seeked row substituted -- still zero-allocation.
+  - **`readRow(row, out)`** -- fills a caller-owned sink (an `Array` or any `TypedArray`) indexed by field id, no record object materialized -- the SoA-to-AoS bridge.
+  - **`bytes(row, fieldId, len)`** and **`bytes(row, fieldId)`** -- a borrowed `Uint8Array` view over raw bytes: the escape hatch for a blob or variable-length field. The two-argument form reads the span length from a sibling `lengthField`. Copy what you keep.
   - **`field` / `typeOf` / `offsetOf`** -- name-to-id resolution and per-field introspection.
 - **`LiteBinaryReader.fromBaked(baked, options?)`** and **`fromLBK1Shard(shard, options?)`** -- two cold constructors that read a sibling's output directly (see [Sibling cooperation](#sibling-cooperation)).
 - **Type-code constants** -- `T_F32`..`T_U8` (0..7), byte-for-byte `lite-bake`'s table, plus `IS_LITTLE_ENDIAN` and `VERSION`.
@@ -183,13 +187,71 @@ get(row, fieldId): number      // generic; dispatches on the stored type code
 
 `row` is in `[0, count)` and `fieldId` is a valid id -- **unchecked for speed**. Validation lives at the door, not per read. One method per type keeps each call site monomorphic; use a typed `getX` in a tight loop and `get` only when the type is data-driven. Every one of these allocates **nothing**.
 
+### The row cursor
+
+```ts
+seek(row: number): this   // sets the cursor; returns this (chainable)
+f64(fieldId): number   f32(fieldId): number
+i32(fieldId): number   u32(fieldId): number
+i16(fieldId): number   u16(fieldId): number
+i8(fieldId): number    u8(fieldId): number
+val(fieldId): number   // generic; dispatches on the stored type code
+```
+
+For a sequential scan, `seek(row)` once and then read fields off the cursor -- ergonomic when a loop walks rows in order:
+
+```js
+const temp = reader.field('temp'), status = reader.field('status');
+for (let r = 0; r < reader.count; r++) {
+  reader.seek(r);
+  if (reader.u8(status) === 1) sum += reader.f32(temp);
+}
+```
+
+Each cursor read is the matching `getX` body with the seeked row substituted -- monomorphic, branch-free, and zero-allocation. `seek` is **unchecked** (it only sets the cursor and returns `this`), the same trust model as the row-passing getters; the row-passing `getX(row, fieldId)` API stays stateless and is the recommended form for random access. Both read the same bytes.
+
+### Row fill
+
+```ts
+readRow<T extends { length: number; [i: number]: number }>(row: number, out: T): T
+```
+
+Fills a **caller-owned** sink indexed by field id -- `out[i]` receives field `i` of `row` -- and returns `out`. No record object is materialized; pass a reused `Array` or a `TypedArray` and the fill is zero-allocation:
+
+```js
+const out = new Array(reader.fieldCount);   // allocated once, reused every row
+for (let r = 0; r < reader.count; r++) {
+  reader.readRow(r, out);                    // out[0..fieldCount) filled in place
+  handle(out);
+}
+```
+
+A sink that is `null`, has no numeric `length`, or is shorter than `fieldCount` throws `R_BAD_LENGTH` **before any write** -- the door exists to protect the zero-allocation claim itself, since a short `Array` would auto-grow. The loop bounds on `fieldCount`, not `out.length`, so a longer sink is fine and a hostile `length` getter cannot force a short write or a read past.
+
 ### The bytes escape hatch
 
 ```ts
-bytes(row: number, fieldId: number, len: number): Uint8Array
+bytes(row: number, fieldId: number, len: number): Uint8Array   // explicit length
+bytes(row: number, fieldId: number): Uint8Array                // length from a sibling lengthField
 ```
 
-A zero-copy `Uint8Array` view over `len` raw bytes at a field position -- for a blob, a variable-length field, or a foreign sub-record. The view **aliases the buffer**: it is borrowed, valid until the buffer changes. Copy what you keep. This allocates one small view wrapper (it is the one non-zero-GC method) -- do not call it on the frame hot path. A bad `len` throws `R_BAD_LENGTH`; a span past the buffer throws `R_BUFFER_TOO_SMALL` (never a raw `RangeError` without a `.code`).
+A zero-copy `Uint8Array` view over raw bytes at a field position -- for a blob, a variable-length field, or a foreign sub-record. The view **aliases the buffer**: it is borrowed, valid until the buffer changes. Copy what you keep. This allocates one small view wrapper (it is the one non-zero-GC method) -- do not call it on the frame hot path. A bad `len` throws `R_BAD_LENGTH`; a span past the buffer throws `R_BUFFER_TOO_SMALL` (never a raw `RangeError` without a `.code`).
+
+The two-argument form reads the length from a sibling field: mark a schema field with `lengthField` naming the field that carries its run length, and `bytes(row, fieldId)` resolves that length per row.
+
+```js
+const reader = new LiteBinaryReader(buf, {
+  schema: [
+    { name: 'len',  type: T_U32, offset: 0 },
+    { name: 'blob', type: T_U8,  offset: 4, lengthField: 'len' },  // span length is the 'len' field
+  ],
+  stride: 20,
+});
+const blob = reader.field('blob');
+const span = reader.bytes(0, blob);   // len read from the sibling 'len' field at row 0
+```
+
+The resolved length flows through the same coded doors: a length that is not a non-negative integer throws `R_BAD_LENGTH`, and a span past the buffer throws `R_BUFFER_TOO_SMALL`. A `lengthField` naming an unknown field is refused at construction with `R_UNKNOWN_FIELD`, and a self-referencing one with `R_BAD_SCHEMA`. Calling the two-argument form on a field with no `lengthField` throws `R_BAD_LENGTH`. No new type code and no new error code -- a variable-length field is an ordinary field plus a `lengthField` pointer.
 
 ### Sibling cooperation
 
@@ -216,7 +278,7 @@ Both validate the argument SHAPE before any dereference, so a null or malformed 
 | `T_U16`  | 6     | `getUint16`   | 2             |
 | `T_U8`   | 7     | `getUint8`    | 1             |
 
-Byte-for-byte `@zakkster/lite-bake`'s `Types` table, so a `lite-bake` schema drops into this reader unchanged. `IS_LITTLE_ENDIAN` (the host byte order, detected once) and `VERSION` (`'0.2.0'`) are also exported.
+Byte-for-byte `@zakkster/lite-bake`'s `Types` table, so a `lite-bake` schema drops into this reader unchanged. `IS_LITTLE_ENDIAN` (the host byte order, detected once) and `VERSION` (`'0.3.0'`) are also exported.
 
 ### Error codes
 
@@ -278,9 +340,13 @@ One `LiteBinaryReader` does all its allocation in the constructor: it compacts t
 | --------- | ------------------------ |
 | `getF64`..`getU8`  | **0** |
 | `get` (generic)    | **0** |
+| `seek` + `f64`..`u8` / `val` (cursor) | **0** |
+| `readRow(row, out)` into a reused sink | **0** |
 | `field` / `typeOf` / `offsetOf` | **0** |
-| `bytes(row, field, len)` | one `Uint8Array` view wrapper (documented; not for the frame hot path) |
+| `bytes(row, field[, len])` | one `Uint8Array` view wrapper (documented; not for the frame hot path) |
 | constructor        | once, per `(source, layout)` -- SoA tables + `DataView`; a non-full-span view also copies to an owned window |
+
+Each new hot surface carries its own zero-alloc and retained-alloc gate: the cursor reads and `readRow` are held to **0 B/op** and **0 retained bytes** the same way the typed getters are.
 
 The one cold branch is the throw path: a coded error is built (and its message concatenated) only when a read is invalid, never in steady state. The torture gate (`@zakkster/lite-leak` + `@zakkster/lite-gc-profiler`, run under `--expose-gc`) proves **0 B/op** and **0 retained bytes** across the read loop and prints exactly `ok`. A `LBR_TORTURE_BREAK=1` control injects a retained allocation into that same loop and the alloc gate rejects it with a non-zero exit -- a gate that cannot fail is decorative.
 
@@ -294,6 +360,9 @@ The one cold branch is the throw path: a coded error is built (and its message c
 - **A detached buffer fails closed, not with a raw TypeError (BR-08, BR-09).** A transferred-away `ArrayBuffer` still passes `instanceof ArrayBuffer` yet blows up at `new DataView`. It is refused with a coded `R_BAD_SOURCE` first. Detection uses `ArrayBuffer.prototype.detached` on Node 21+ and a guarded `DataView` construction on the `node>=18` floor; a legitimately zero-length buffer is never misclassified. A `DataView` source needs extra care -- its `byteOffset`/`byteLength` getters THROW on a detached buffer (a `TypedArray`'s return 0) -- so the view branch probes the underlying buffer for detachment before reading any of the view's own getters.
 - **`null` is not zero.** `byteOffset` is checked with an explicit `=== undefined`, never `|| 0`, so a `NaN`, `false`, or fractional offset reaches the integer guard and throws `R_BAD_OFFSET` instead of silently reading at offset 0.
 - **The read path is unchecked, on purpose.** All validation and all allocation happen at the construction door. `row` and `fieldId` are trusted in the hot getters, one method per type, so a read is monomorphic and branch-free. Correctness is bought once, at construction, not re-paid every read.
+- **The cursor is the only mutable state, and only `seek` moves it.** The row cursor makes sequential scans ergonomic without giving up the zero-allocation, unchecked-read contract: `seek` sets one field and returns `this`, the cursor reads inline the same address arithmetic as `getX`, and the stateless row-passing API is untouched and remains the recommended form for random access.
+- **`readRow`'s door protects the zero-alloc claim, not the caller.** The one per-call check `readRow` makes -- that the sink has a numeric `length` at least `fieldCount` -- exists because a short `Array` would silently auto-grow and allocate. It is justified where a per-read bounds check on `getX` is not, because it guards the property the method advertises.
+- **Variable-length adds a pointer, not a code.** A variable-length field is an ordinary numeric field plus a `lengthField` naming the sibling that carries its run length. The length is resolved cold at construction into a per-field table; every failure reuses an existing coded door (`R_UNKNOWN_FIELD`, `R_BAD_LENGTH`, `R_BUFFER_TOO_SMALL`). The `R_*` union stays at exactly ten and the type table at exactly eight -- both gated by the drift test.
 - **The sibling type table is shared, not re-declared.** `T_F32`..`T_U8` are byte-for-byte `lite-bake`'s table, so a `lite-bake` schema needs no translation. LBK1's colliding `lane_kind` table is translated explicitly in `fromLBK1Shard`, so a single ambiguous integer never crosses the boundary silently.
 - **The shipped `.d.ts` is gated against drift.** `Reader.d.ts` is hand-written, but `test/dts-drift.test.js` reads the text of the source, the types, and `package.json` and fails if the `R_*` code union, the export set, or the version drift apart -- with mutation controls proving the gate has teeth.
 
@@ -301,16 +370,16 @@ The one cold branch is the throw path: a coded error is built (and its message c
 
 ## Testing
 
-**49 deterministic tests, all pass**, plus a torture gate that proves leak-freedom and a controls run that proves the door.
+**60 deterministic tests, all pass**, plus a torture gate that proves leak-freedom and a controls run that proves the door.
 
 ```bash
-npm test                 # 49 node:test cases (contract + boundary + drift guard)
+npm test                 # 60 node:test cases (contract + boundary + drift guard)
 npm run torture          # @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints "ok"
 npm run torture:controls # the door + coherence controls (every gate can fail)
 npm run verify           # test + torture + controls, the publish gate
 ```
 
-The suites cover: read fidelity across every type code and both endiannesses; the full fail-closed construction door (every `R_*` path, including detached-buffer BR-08/BR-09, the unaligned-offset read, the derived-vs-explicit stride and count, and the partial-view copy BR-07); the `bytes()` escape hatch and its bounds; the sibling constructors against malformed input; and the `.d.ts` drift guard (code-union, export, and version parity, with mutation controls). The torture harness runs read-fidelity, degenerate-layout, an adversarial source-x-count-x-offset door matrix asserting throws-iff-incoherent across every source kind (including detached and `DataView`), a differential check against reference oracles, and a zero-alloc / retained-alloc / soak witness. `LBR_TORTURE_BREAK=1` injects a retained allocation to prove the gate can fail; no gate output is a FAIL.
+The suites cover: read fidelity across every type code and both endiannesses; the full fail-closed construction door (every `R_*` path, including detached-buffer BR-08/BR-09, the unaligned-offset read, the derived-vs-explicit stride and count, and the partial-view copy BR-07); the `bytes()` escape hatch and its bounds; the sibling constructors against malformed input; the cursor, `readRow`, and variable-length surfaces (cursor-vs-`getX` parity, the `readRow` door and its reentrancy, and variable-length spans at nonzero-base and partial-view sources); and the `.d.ts` drift guard (code-union, export, and version parity, with mutation controls). The torture harness runs read-fidelity, degenerate-layout, an adversarial source-x-count-x-offset door matrix asserting throws-iff-incoherent across every source kind (including detached and `DataView`), a cursor-vs-`getX` differential, per-surface zero-alloc and retained-alloc gates, and a soak witness. `LBR_TORTURE_BREAK=1` injects a retained allocation to prove the gate can fail; no gate output is a FAIL.
 
 ---
 
@@ -320,7 +389,7 @@ The suites cover: read fidelity across every type code and both endiannesses; th
 - **Not a writer or an encoder.** It only reads. `@zakkster/lite-bake` bakes a column store; `@zakkster/lite-bake-stream` frames a stream. This reads their output and any other bytes.
 - **Not a string decoder.** Reads return numbers. A string field is a raw byte span -- use `bytes()` to borrow it and decode it yourself (or resolve a `lite-bake-stream` string index in that package).
 - **Not a bounds-checked read on the hot path.** `row`/`fieldId` are trusted in the getters by design; the bounds are proven once at the door. Pass an out-of-range `row` and you get whatever `DataView` does, not a coded error. Keep `row` in `[0, count)`.
-- **Not a variable-length record reader.** The model is fixed `stride`. A variable-length or nested record is out of scope for the hot path; reach into it with `bytes()` and parse the span yourself.
+- **Not a variable-length *record* reader.** The record model is fixed `stride`. A variable-length *field* within a fixed-stride record is supported -- mark it with a `lengthField` and read the span with `bytes(row, id)` -- but a record whose total size varies row to row is out of scope; walk it with your own cursor over `bytes()` spans.
 - **Not a mutation API.** It is a reader. There is no `setX`. Write with the sibling writers, or your own `DataView`.
 
 ---

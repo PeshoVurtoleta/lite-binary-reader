@@ -28,6 +28,22 @@
  * collides by value (only F64==1 is shared); `fromLBK1Shard` TRANSLATES it, so
  * a single ambiguous integer never crosses the boundary.
  *
+ * Row cursor (D4). For a sequential scan a caller may `seek(row)` ONCE and then
+ * read fields without re-passing the row: `r.seek(i).f64(id)`, `r.val(id)`. This
+ * makes the cursor API STATEFUL (`_cursor` moves on each `seek`); the row-passing
+ * getX/get form stays STATELESS and is the recommended shape for random access.
+ * Both APIs read the SAME bytes with the SAME address arithmetic. `readRow(row,
+ * out)` fills a caller-owned length>=fieldCount sink (Array or TypedArray) by
+ * field id -- the SoA->AoS bridge, no record object materialized.
+ *
+ * Variable-length (D4). A field may carry `lengthField`, the NAME of a sibling
+ * field whose integer value at the same row is this field's byte run length.
+ * Resolved to an id ONCE at construction; `bytes(row, id)` (2-arg) then reads
+ * that length and returns the borrowed span. It reuses the existing coded
+ * `bytes()` door -- R_BAD_LENGTH / R_BUFFER_TOO_SMALL -- and an unknown
+ * lengthField NAME is an R_UNKNOWN_FIELD at construction: NO new type code, NO
+ * new R_* code. The R_* list below stays at exactly 10.
+ *
  * Laws honored (suite CLAUDE.md):
  *   - Zero allocation on the read hot path (getX / get). All validation and
  *     any allocation happen at the construction DOOR or on the throw path.
@@ -51,7 +67,7 @@
  *   R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
  */
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 
 // --- type codes -- byte-for-byte lite-bake's `Types` table (D3) --------------
 export const T_F32 = 0;
@@ -109,7 +125,7 @@ export class LiteBinaryReader {
     /**
      * @param {ArrayBuffer|ArrayBufferView} source  the raw bytes.
      * @param {{
-     *   schema: Array<{name:string, type:number, offset:number}>,
+     *   schema: Array<{name:string, type:number, offset:number, lengthField?:string|number}>,
      *   stride?: number,          // bytes per record; derived from schema if omitted
      *   count?: number,           // record count; derived from buffer size if omitted
      *   littleEndian?: boolean,   // read byte order (default true -- the sane wire default)
@@ -183,6 +199,22 @@ export class LiteBinaryReader {
             if (end > maxEnd) maxEnd = end;
         }
 
+        // --- variable-length wiring (D4, cold): resolve each field's optional --
+        // `lengthField` sibling NAME to its id ONCE, so the 2-arg bytes() reads
+        // the run length with no name lookup on the (cold) call. -1 = "no
+        // lengthField" (the common case). The name map is complete above, so a
+        // forward or backward sibling reference both resolve. An unknown name is
+        // R_UNKNOWN_FIELD and a self-reference is R_BAD_SCHEMA -- NO new R_* code.
+        const lenOf = new Int32Array(n).fill(-1);
+        for (let i = 0; i < n; i++) {
+            const lf = fields[i].lengthField;
+            if (lf === undefined) continue;
+            const lid = name.get(lf);
+            if (lid === undefined) fail("R_UNKNOWN_FIELD", "field '" + fields[i].name + "' lengthField '" + String(lf) + "' is not a field name");
+            if (lid === i) fail("R_BAD_SCHEMA", "field '" + fields[i].name + "' lengthField refers to itself");
+            lenOf[i] = lid;
+        }
+
         // --- stride: given, or the tightly-packed minimum ---------------------
         let stride = opts.stride;
         if (stride === undefined) {
@@ -226,6 +258,8 @@ export class LiteBinaryReader {
         this._count = count;
         this._base = base;
         this._le = opts.littleEndian === undefined ? true : !!opts.littleEndian;
+        this._cursor = 0;    // D4 row cursor: moved only by seek(); a Smi by contract
+        this._lenOf = lenOf; // per-field lengthField id, or -1 (variable-length wiring)
     }
 
     // --- introspection (cold) -------------------------------------------------
@@ -289,12 +323,87 @@ export class LiteBinaryReader {
      * wrapper (not zero-GC) -- do not call it on the frame hot path.
      */
     bytes(row, fieldId, len) {
+        if (len === undefined) len = this._lenAt(row, fieldId);
         // BR-05: a COLD coded door on the D9 escape hatch (NOT the numeric hot
         // path). A raw Uint8Array RangeError carries no .code; refuse first.
         if (!Number.isInteger(len) || len < 0) fail("R_BAD_LENGTH", "bytes() len must be a non-negative integer, got " + len);
         const pos = this._base + row * this._stride + this._off[fieldId];
         if (pos + len > this._buffer.byteLength) fail("R_BUFFER_TOO_SMALL", "bytes() span ends at " + (pos + len) + ", past buffer length " + this._buffer.byteLength);
         return new Uint8Array(this._buffer, pos, len);
+    }
+
+    // --- the row cursor (D4, zero-alloc) --------------------------------------
+    // Ergonomic sequential scans: `seek(row)` once, then read fields without
+    // re-passing the row. UNCHECKED to match the getX trust model -- the row is a
+    // caller contract (keep it a Smi), validation lives at the door not per seek.
+    // The cursor reads INLINE the exact getF64..getU8 / get address arithmetic
+    // with `_cursor` substituted for `row`, so each stays monomorphic and
+    // frame-flat -- never a delegation through getX (a second frame per read).
+
+    /** Point the cursor at `row` (unchecked, chainable). `r.seek(i).f64(id)`. */
+    seek(row) { this._cursor = row; return this; }
+
+    f64(id) { return this._dv.getFloat64(this._base + this._cursor * this._stride + this._off[id], this._le); }
+    f32(id) { return this._dv.getFloat32(this._base + this._cursor * this._stride + this._off[id], this._le); }
+    i32(id) { return this._dv.getInt32(this._base + this._cursor * this._stride + this._off[id], this._le); }
+    u32(id) { return this._dv.getUint32(this._base + this._cursor * this._stride + this._off[id], this._le); }
+    i16(id) { return this._dv.getInt16(this._base + this._cursor * this._stride + this._off[id], this._le); }
+    u16(id) { return this._dv.getUint16(this._base + this._cursor * this._stride + this._off[id], this._le); }
+    i8(id) { return this._dv.getInt8(this._base + this._cursor * this._stride + this._off[id]); }
+    u8(id) { return this._dv.getUint8(this._base + this._cursor * this._stride + this._off[id]); }
+
+    /** Generic cursor read: the `get` switch over `_cursor`. */
+    val(id) {
+        const pos = this._base + this._cursor * this._stride + this._off[id];
+        const dv = this._dv, le = this._le;
+        switch (this._type[id]) {
+            case T_F64: return dv.getFloat64(pos, le);
+            case T_F32: return dv.getFloat32(pos, le);
+            case T_I32: return dv.getInt32(pos, le);
+            case T_U32: return dv.getUint32(pos, le);
+            case T_I16: return dv.getInt16(pos, le);
+            case T_U16: return dv.getUint16(pos, le);
+            case T_I8:  return dv.getInt8(pos);
+            default:    return dv.getUint8(pos); // T_U8
+        }
+    }
+
+    /**
+     * Fill a caller-owned sink with every field of `row`, indexed by field id --
+     * the SoA->AoS bridge with NO record object allocated (the caller owns `out`).
+     * `out` is an Array or any TypedArray, indexed `out[i] = <field i at row>` for
+     * i in [0,fieldCount). Cold door: refuse a sink that cannot hold one row -- an
+     * Array too short would auto-GROW (an allocation), a TypedArray too short
+     * would silently drop cells. Reuses R_BAD_LENGTH (no new code). Returns `out`.
+     */
+    readRow(row, out) {
+        if (out == null || typeof out.length !== "number" || out.length < this._fieldCount) {
+            fail("R_BAD_LENGTH", "readRow out must be indexable with a length >= fieldCount " + this._fieldCount);
+        }
+        const pos = this._base + row * this._stride, dv = this._dv, le = this._le, n = this._fieldCount;
+        for (let i = 0; i < n; i++) {
+            const p = pos + this._off[i];
+            switch (this._type[i]) {
+                case T_F64: out[i] = dv.getFloat64(p, le); break;
+                case T_F32: out[i] = dv.getFloat32(p, le); break;
+                case T_I32: out[i] = dv.getInt32(p, le); break;
+                case T_U32: out[i] = dv.getUint32(p, le); break;
+                case T_I16: out[i] = dv.getInt16(p, le); break;
+                case T_U16: out[i] = dv.getUint16(p, le); break;
+                case T_I8:  out[i] = dv.getInt8(p); break;
+                default:    out[i] = dv.getUint8(p); // T_U8
+            }
+        }
+        return out;
+    }
+
+    /** Resolve the run length for a variable-length field at `row` via its
+     *  lengthField sibling. Underscore-prefixed: cold, internal to the 2-arg
+     *  bytes() dispatch, and OUT of the public member inventory. */
+    _lenAt(row, fieldId) {
+        const lid = this._lenOf[fieldId];
+        if (!(lid >= 0)) fail("R_BAD_LENGTH", "field " + fieldId + " has no lengthField; call bytes(row, id, len) with an explicit length");
+        return this.get(row, lid);
     }
 
     // --- sibling cooperation (cold constructors) ------------------------------

@@ -7,11 +7,11 @@ fields with NO allocation, at ANY byte offset, with EXPLICIT endianness. Reads
 through a DataView, so a field may sit at an odd (unaligned) offset a typed-array
 lane cannot address. Single-file ESM, zero runtime dependencies, node:test only.
 
-## Status: 0.2.0 - S3: the TypeScript surface + the detached-buffer door
+## Status: 0.3.0 - S4: API sugar (row cursor, readRow, variable-length bytes)
 
 S0 landed the reader and the sibling constructors. S1 hardened the construction
 door (BR-01..BR-04). S2 closed the view-window and sibling-shape holes
-(BR-05..BR-07). S3 (this release) adds the shipped ambient types and closes the
+(BR-05..BR-07). S3 added the shipped ambient types and closed the
 detached-ArrayBuffer family:
 
 - `Reader.d.ts`: a hand-written ambient TypeScript surface for the full runtime
@@ -29,6 +29,32 @@ detached-ArrayBuffer family:
   `R_BAD_SOURCE` -- a DataView's `byteOffset`/`byteLength` getters THROW on a
   detached buffer (a TypedArray's return 0), so the view branch probes the
   underlying buffer for detachment before reading any view getter.
+
+S4 (this release, 0.3.0) adds three additive ergonomic read surfaces on top of
+the same zero-GC read path -- the numeric read bodies (getF64..getU8/get) are
+byte-identical to 0.2.0, the R_* union stays exactly 10, the type table exactly 8
+(both gated by test/dts-drift.test.js), and each new surface has its own 0-B/op
+and retained-alloc gate (decisions/0004):
+
+- Row cursor: `seek(row)` (chainable, returns the reader) plus `f64/f32/i32/u32/
+  i16/u16/i8/u8(fieldId)` and `val(fieldId)` read at the seeked row without
+  re-passing it. The cursor reads inline the same address arithmetic as getX;
+  `seek` is unchecked (the same trust model as getX). The stateless row-passing
+  getX API is unchanged and stays the recommended form for random access.
+- `readRow(row, out)`: fills a caller-owned sink (an Array or any TypedArray)
+  indexed by field id, no record object materialized; returns `out`. A sink that
+  is null, has no numeric length, or is shorter than fieldCount throws
+  `R_BAD_LENGTH` before any write (the door guards the zero-alloc claim: a short
+  Array would auto-grow). The loop bounds on fieldCount, not out.length.
+- Variable-length `bytes(row, fieldId)`: a 2-arg overload. Mark a schema field
+  with `lengthField` naming a sibling field that carries its run length; the
+  overload resolves that length per row and returns the borrowed span. Dispatched
+  on `len === undefined`; the resolved length flows through the existing
+  `R_BAD_LENGTH` / `R_BUFFER_TOO_SMALL` doors. An unknown `lengthField` is refused
+  at construction with `R_UNKNOWN_FIELD`, a self-reference with `R_BAD_SCHEMA`.
+  NO new type code, NO new R_* code -- a variable-length field is an ordinary
+  numeric field plus a `lengthField` pointer. The 3-arg `bytes(row,id,len)` is
+  unchanged.
 
 ## The gap it fills (decisions/0001)
 
@@ -103,11 +129,11 @@ carries a coded `R_*` tag on `error.code`:
                     bytes() span reads past the buffer
 - R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
 
-## API (0.2.0)
+## API (0.3.0)
 
 Named exports from `@zakkster/lite-binary-reader`:
 
-- VERSION: '0.2.0'
+- VERSION: '0.3.0'
 - IS_LITTLE_ENDIAN: boolean (host byte order, detected once)
 - T_F32=0, T_F64=1, T_I32=2, T_I16=3, T_I8=4, T_U32=5, T_U16=6, T_U8=7
 - LiteBinaryReaderError: Error subclass; `.code` carries the R_* tag
@@ -118,8 +144,10 @@ Constructor:
 - new LiteBinaryReader(source, { schema, stride?, count?, littleEndian?,
   byteOffset? })
   - source: ArrayBuffer or any ArrayBufferView (TypedArray or DataView).
-  - schema: non-empty Array of { name, type, offset }. name is a string or
-    number; type is a T_* code (0..7); offset is a non-negative integer.
+  - schema: non-empty Array of { name, type, offset, lengthField? }. name is a
+    string or number; type is a T_* code (0..7); offset is a non-negative integer;
+    optional lengthField (S4) names a sibling field carrying this field's run
+    length, enabling the 2-arg bytes(row, fieldId) overload.
   - stride: bytes per record; defaults to the tightly-packed minimum (the
     largest field end).
   - count: record count; defaults to floor((byteLength - byteOffset) / stride).
@@ -141,12 +169,35 @@ Read hot path (zero-alloc; row in [0,count), fieldId a valid id, UNCHECKED):
   branch per read). Use a typed getX in a tight loop; use get when the type is
   data-driven.
 
+Row cursor (S4; zero-alloc; sequential-scan sugar over the same read path):
+
+- seek(row) -> the reader (chainable). Sets the cursor; UNCHECKED (same trust
+  model as getX). Only seek moves the cursor.
+- f64/f32/i32/u32/i16/u16/i8/u8(fieldId) -> number. Read fieldId at the seeked
+  row; each is the matching getX body with the cursor row substituted.
+- val(fieldId) -> number. Generic cursor read; dispatches on the stored type code.
+- The row-passing getX API stays stateless and is the recommended form for random
+  access; both read the same bytes.
+
+Row fill (S4; zero-alloc into a caller-owned sink):
+
+- readRow(row, out) -> out. Fills out[i] with field i of `row` for i in
+  [0,fieldCount); `out` is an Array or any TypedArray. No record object is
+  materialized. A sink that is null, has no numeric length, or is shorter than
+  fieldCount throws R_BAD_LENGTH before any write (guards the zero-alloc claim: a
+  short Array would auto-grow). The loop bounds on fieldCount, not out.length.
+
 Escape hatch (allocates ONE small view wrapper -- not zero-GC, not for the frame
 hot path):
 
 - bytes(row, fieldId, len) -> a BORROWED Uint8Array view over `len` raw bytes at
   the field position. It aliases the buffer; copy what you keep. A bad len throws
   R_BAD_LENGTH; a span past the buffer throws R_BUFFER_TOO_SMALL.
+- bytes(row, fieldId) -> the same, with `len` read per row from a sibling field
+  (S4). Mark the field with `lengthField` naming the sibling that carries the run
+  length. Dispatched on len === undefined; the resolved length flows through the
+  same R_BAD_LENGTH / R_BUFFER_TOO_SMALL doors. Calling it on a field with no
+  lengthField throws R_BAD_LENGTH. NO new type code, NO new R_* code.
 
 Sibling cooperation (cold constructors):
 
@@ -162,10 +213,11 @@ Sibling cooperation (cold constructors):
 
 ## Zero-GC posture (suite CLAUDE.md)
 
-Zero allocation on the read hot path: getX / get / the row address arithmetic
-allocate nothing. Every allocation lives at the construction door or on the
-throw path. `bytes()` is the one intentional exception (a Uint8Array view
-wrapper) and is documented as such. The torture gate
+Zero allocation on the read hot path: getX / get / the cursor reads (seek +
+f64..u8 / val) / readRow into a reused sink / the row address arithmetic allocate
+nothing, each with its own 0-B/op and retained-alloc gate. Every allocation lives
+at the construction door or on the throw path. `bytes()` is the one intentional
+exception (a Uint8Array view wrapper) and is documented as such. The torture gate
 (`node --expose-gc test/torture.mjs`, @zakkster/lite-leak +
 @zakkster/lite-gc-profiler) proves 0 B/op and 0 retained bytes across the read
 loop and prints exactly `ok`; a `LBR_TORTURE_BREAK=1` control injects a retained
@@ -173,7 +225,7 @@ allocation and the gate rejects it (a gate that cannot fail is decorative).
 
 ## Testing
 
-- npm test        -- 49 node:test cases (contract + boundary + drift)
+- npm test        -- 60 node:test cases (contract + boundary + drift)
 - npm run torture -- @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints `ok`
 - npm run torture:controls -- the door/coherence controls
 - npm run verify  -- test + torture + controls, the publish gate

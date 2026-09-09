@@ -1,144 +1,182 @@
-# S3 -- v0.2.0 -- Reader.d.ts + BR-08 door + type-drift guard
+# S4 -- v0.3.0 -- API sugar (each surface pinned zero-alloc)
 
-status: PLANNED (awaiting review, then run planner -> coder -> reviewer -> qa)
-version_target: 0.2.0
-depends_on: S2 (DONE, reviewer-APPROVED, v0.1.2)
-blocks: S4
-roadmap anchor: ROADMAP.md section 6, "S3 -- v0.2.0 -- Reader.d.ts"; findings BR-08 (and the
-  door-contract note under BR-05/BR-06, both already fixed in S2 -- see "State check" below).
-
-===============================================================================
-## State check (what S2 already did, so S3 does NOT redo it)
-===============================================================================
-The ROADMAP findings table still labels BR-05 and BR-06 as "S3", but S2 PROMOTED both to
-enforced coded doors:
-  - BR-05: bytes() -> R_BUFFER_TOO_SMALL (overflow) / R_BAD_LENGTH (bad len).  DONE.
-  - BR-06: fromBaked(null) -> R_BAD_SOURCE; fieldless fromLBK1Shard -> R_BAD_SCHEMA.  DONE.
-Verified by scratchpad/probe.mjs. So the ONLY code fix left in the S3 door family is BR-08.
-(Housekeeping task H0 below re-labels those two rows in ROADMAP so the table stops lying.)
+status: APPROVED -- SCOPE LOCKED: ship T1 (cursor) + T2 (readRow) + T4 (variable-length) as
+  v0.3.0. T3 (native typed-lane fast path) is DEFERRED to its own focused session (provisionally
+  S4b / v0.4.0), per the recommendation below. T3 stays in this file for reference but is OUT OF
+  SCOPE for this pipeline run -- do NOT implement it. S5 baker-cooperation reflows after S4b.
+version_target: 0.3.0
+depends_on: S2 (DONE, fail-closed door) + S3 (DONE, v0.2.0, Reader.d.ts + drift gate + BR-08/BR-09)
+blocks: nothing hard; S5 (baker cooperation) is independent and can precede or follow S4
+roadmap anchor: ROADMAP.md section 6, "S4 -- v0.3.0 -- API sugar"; section 5 shows S4 depends only on S2.
 
 ===============================================================================
-## Findings this session closes
+## State check (what is already true, so S4 does NOT redo it)
 ===============================================================================
-BR-08 (S3, hygiene, fails SAFELY today): a DETACHED ArrayBuffer is still
-`instanceof ArrayBuffer`, so it passes coercion at Reader.js:111-112 and reaches
-`new DataView(buffer)` at Reader.js:183, which throws a raw TypeError
-("Cannot perform DataView constructor on a detached ArrayBuffer") -- no `.code`.
-Same uncoded-door class as BR-06. No read-past; the only defect is the useless error.
-Repro: scratchpad/probe2.mjs -- `mc.postMessage(buf,[buf])` then `new LiteBinaryReader(buf,{schema})`.
+- The door is fail-closed (S1/S2): every incoherent shape throws a coded R_* at construction.
+  The read hot path is unchecked BY DESIGN and every new read surface inherits that contract.
+- The 9 numeric read bodies (getF64..getU8) + get + bytes are the pinned zero-GC core.
+  S4 is ADDITIVE: it must not touch those bodies. The reviewer diffs them against v0.2.0.
+- Reader.d.ts ships and is gated by test/dts-drift.test.js. CONSEQUENCE FOR S4: every new
+  public method/getter MUST be added to Reader.d.ts in the SAME session, or the drift gate
+  (export parity + classMembers >= N) fails. The gate now forces types to stay in sync -- lean on it.
+- The R_* union is exactly 10 and the type-code table is exactly 8. Both are asserted by the
+  drift gate. S4 adds NO new code and NO new type code (see T4 -- variable-length reuses
+  R_UNKNOWN_FIELD / R_BUFFER_TOO_SMALL / R_BAD_LENGTH). If a task seems to need a new R_*, stop
+  and re-scope: the union staying 10 is a hard invariant this session must preserve.
+
+===============================================================================
+## SCOPING DECISION FOR YOUR REVIEW (resolve before the pipeline runs)
+===============================================================================
+The roadmap bundles FOUR surfaces into S4/v0.3.0. Three of them (T1 cursor, T2 readRow,
+T4 variable-length) are thin ergonomic wrappers that REUSE the existing DataView read path --
+low correctness risk, provable by the existing T6/T2 gates plus small additions.
+
+The fourth (T3, the native typed-lane fast path) is different in kind: it is a SECOND read
+path (typed-array indexing instead of DataView) that must be byte-identical to the first on
+every aligned+native-endian cell AND correctly DECLINE on every unaligned or wrong-endian
+cell. That is a full differential-proof surface (alignment x endianness x type), the heaviest
+correctness burden in the package since S1's read-fidelity invariant.
+
+  RECOMMENDATION: ship T1 + T2 + T4 as v0.3.0 (three ergonomic surfaces, one clean release),
+  and give T3 (typed-lane fast path) its own focused session -- provisionally "S4b / v0.4.0",
+  with S5 baker-cooperation reflowing after it. Rationale: T3's differential + fallback matrix
+  deserves undivided review, and a bug there reads WRONG BYTES silently (an S1-class defect),
+  whereas T1/T2/T4 at worst throw. Bundling a silent-corruption-risk feature with three safe
+  wrappers dilutes the review attention T3 needs.
+
+  ALTERNATIVE: keep all four in v0.3.0 as the roadmap states. If you choose this, T3 still gets
+  its own differential tier (T5 fast-vs-slow) and its own t9 control; the DONE-WHEN below covers it.
+
+The tasks below are written so EITHER choice works: T3 is self-contained and can be lifted out.
+Everything else is unaffected by the split. Mark your choice at the top of the planner run.
 
 ===============================================================================
 ## Tasks
 ===============================================================================
 
-### T1 -- BR-08: coded door for a detached buffer  (Reader.js, COLD PATH only)
-Root cause: the `instanceof ArrayBuffer` and `ArrayBuffer.isView` branches accept a
-buffer whose backing store has been transferred/detached; the throw surfaces later at
-DataView construction with no code.
+### T1 -- Row cursor: seek(row) + f64(id)/f32(id)/i32(id)/.../u8(id)  (Reader.js, additive)
+Ergonomic sequential scans: seek a row once, then read fields without re-passing the row.
+  - New mutable state: `this._cursor` (default 0), set only by `seek`. This makes the reader
+    STATEFUL for the cursor API -- document it; the row-passing getX API stays stateless and
+    is the recommended form for random access. The two APIs read the SAME bytes.
+  - `seek(row)`: sets `_cursor = row`, returns `this` (chainable: `r.seek(i).f64(x)`).
+    DECISION (flag for review): UNCHECKED to match the getX trust model (the scan loop
+    `for (r=0;r<count;r++)` is trusted), OR a cold bounds check `0 <= row < count` throwing a
+    coded R_* (row is set once per row, not per read, so a check here is affordable and catches
+    the one error getX deliberately ignores). RECOMMEND unchecked for contract symmetry; note
+    the choice in decisions/.
+  - `f64(id)..u8(id)` (8 methods) + `val(id)` (the get-equivalent, type-dispatched): read at
+    `_cursor`. IMPLEMENTATION: INLINE the same address arithmetic as getF64.. (do NOT delegate
+    `f64(id){return this.getF64(this._cursor,id)}`) so each cursor read stays monomorphic and
+    frame-flat -- matches the getX bodies exactly with `_cursor` substituted for `row`. This
+    duplicates 8 one-line read expressions; that is the intended cost of a zero-overhead cursor.
+ASSERTION: for every type and every row, `r.seek(row).f64(id) === r.getF64(row, id)` (add to
+  T0/T5). ZERO-ALLOC: seek + each cursor read gated at 0 B/op (T6). The getX bodies stay byte-identical.
 
-Fix (in the coercion block, Reader.js:110-123), BEFORE `new DataView`:
-  - ArrayBuffer branch: after `source instanceof ArrayBuffer`, if the buffer is detached
-    -> fail("R_BAD_SOURCE", "source ArrayBuffer is detached").
-  - View branch: if `source.buffer` is detached -> same coded fail (a view over a
-    detached buffer reports byteLength 0 but must not be mistaken for empty).
-Detection must DISTINGUISH detached from a legitimately zero-length buffer:
-  - Node 20+: `ArrayBuffer.prototype.detached` getter (`buffer.detached === true`).
-  - Portable floor (engines: node>=18): a `try { new DataView(buffer) } catch` probe,
-    or `structuredClone`-free detection. Prefer feature-detect `detached` once at module
-    load (like IS_LITTLE_ENDIAN), fall back to a guarded DataView construction that
-    re-throws as R_BAD_SOURCE. Decide in the planner; record the choice in decisions/.
-CONSTRAINT: the fix lives entirely in the cold constructor path. The 9 numeric read
-bodies (getF64..getU8) + get + bytes stay BYTE-IDENTICAL. No new per-read work.
-Reuse the existing R_BAD_SOURCE code -- do NOT invent R_DETACHED (keeps the union at 10;
-a detached source IS a bad source). Note in decisions/ why we fold it into R_BAD_SOURCE.
+### T2 -- Out-param row fill: readRow(row, out)  (Reader.js, additive)
+The SoA->AoS bridge: write every field of one row into a CALLER-OWNED sink, no record allocated.
+  - PRIMARY form: `out` is an array indexed by field id -- `out[i] = <read field i at row>` for
+    i in [0,fieldCount). Fastest, no key lookup. Cold door: require `out.length >= fieldCount`
+    (an Array that is too short would auto-GROW = allocation; refuse it) -- reuse an existing
+    coded R_* (R_BAD_LENGTH is the honest fit; confirm in planner) rather than inventing one.
+  - OPTIONAL convenience form: `out` is a plain object; write `out[name] = value` for each field
+    name. MUST NOT create keys that force hidden-class churn/alloc -- document that the caller
+    passes a pre-shaped object. If this form complicates the zero-alloc proof, DEFER it to a
+    later session and ship array-by-id only. RECOMMEND: array-by-id this session; object form deferred.
+  - readRow itself allocates NOTHING (caller owns out); it uses the type-dispatched read per field.
+ASSERTION: `readRow(row, out)` fills out[i] === get(row, i) for all i; a too-short array throws a
+  coded R_*; the fill loop is 0 B/op over >= N rows into a reused out (T6).
 
-### T2 -- Reader.d.ts  (the TypeScript surface)
-Emit a hand-written ambient `.d.ts` covering exactly the runtime exports (verified list):
-  - `VERSION: string`.
-  - Type-code consts as `const` literals: `T_F32: 0, T_F64: 1, T_I32: 2, T_I16: 3,
-    T_I8: 4, T_U32: 5, T_U16: 6, T_U8: 7` (literal types, not `number`, so unions narrow).
-  - `IS_LITTLE_ENDIAN: boolean`.
-  - `type TypeCode = 0|1|2|3|4|5|6|7;`
-  - `interface Field { name: string | number; type: TypeCode; offset: number; }`
-    (name is used as a Map key -- allow string|number; the code accepts both).
-  - `interface Schema/Options { schema: Field[]; stride?: number; count?: number;
-    byteOffset?: number; littleEndian?: boolean; }` -- match the real opts keys in Reader.js.
-  - `class LiteBinaryReader` with the ctor `(source: ArrayBuffer | ArrayBufferView, opts)`,
-    getters (`count`, `fieldCount`, `stride`, `buffer`, ...), `field(name)`, `offsetOf(id)`,
-    the 9 typed getters `getF64(row,id): number` ... `getU8`, `get(row,id): number`,
-    `bytes(row, id_or_off, len): Uint8Array`, and the statics
-    `fromBaked(baked): LiteBinaryReader` and `fromLBK1Shard(shard): LiteBinaryReader`.
-    Pull the EXACT public method/getter names from Reader.js -- do not invent surface.
-  - `interface Baked` / `interface Shard` shapes -- read them off the fromBaked /
-    fromLBK1Shard bodies in Reader.js (fields/laneKind/offsetInRow/rowStride/bytes).
-  - `type ReaderErrorCode =` a union of ALL 10 R_* tags currently thrown:
-    R_BAD_COUNT | R_BAD_LENGTH | R_BAD_OFFSET | R_BAD_SCHEMA | R_BAD_SOURCE |
-    R_BAD_STRIDE | R_BAD_TYPE | R_BUFFER_TOO_SMALL | R_DUPLICATE_FIELD | R_UNKNOWN_FIELD.
-  - `class LiteBinaryReaderError extends Error { readonly code: ReaderErrorCode; }`.
-ASCII-only. No stray tool-call tags (grep before trusting). `files[]` already lists it;
-verify it resolves (npm pack includes it after this session).
+### T3 -- Native typed-lane fast path  (Reader.js -- SEPARABLE; the correctness centrepiece)
+When `this._le === IS_LITTLE_ENDIAN` AND a field is naturally aligned, expose lite-bake's
+`typedView[row*elemStride + elemOffset]` shape for the absolute hot loop; else fall back to DataView.
+  - ELIGIBILITY (per field, computed once at construction, COLD): `_le === IS_LITTLE_ENDIAN`
+    AND `(base + fieldOffset) % width === 0` AND `stride % width === 0` (so every row stays
+    aligned). Width = TYPE_BYTES[type]. A U8/I8 field is trivially aligned. Any field failing
+    this is NOT lane-eligible; the reader still serves it via getX.
+  - VIEWS: build at most one typed view per PRESENT eligible type over `_buffer` at construction
+    (cold: a handful of small view wrappers, e.g. `new Float32Array(buffer)`). Precompute per
+    eligible field its `elemStride = stride / width` and `elemOffset = (base + fieldOffset) / width`.
+  - API (flag the exact shape for review): a probe + accessor, called ONCE outside the loop like
+    field(): `laneOf(id)` returns a small descriptor `{ view, elemStride, elemOffset }` for an
+    eligible field, or `null` (caller falls back to getX). Callers then run the tightest loop:
+    `const {view,elemStride,elemOffset}=r.laneOf(x); for(row...) sum+=view[row*elemStride+elemOffset]`.
+    The descriptor is allocated ONCE (cold, like a field-id lookup); the hot loop is a raw typed
+    read with ZERO branch and ZERO alloc. Do NOT bake a per-read eligibility branch into f64(id) --
+    a branch per read defeats the purpose; the fast path is opt-in via laneOf.
+  - ENDIANNESS: typed arrays read HOST order only. On a big-endian READ on a little-endian host
+    (`_le === false` here), NO field is eligible -- laneOf returns null everywhere, getX serves all.
+CORRECTNESS PROOF (non-negotiable for this task): a T5 differential tier asserts, for EVERY
+  eligible field and EVERY row, `view[row*elemStride+elemOffset] === getX(row, id)`; and asserts
+  laneOf returns null for a deliberately unaligned field and for a big-endian reader. A t9 control
+  mutates elemStride/elemOffset by 1 and asserts the differential now FAILS (teeth).
+NON-GOAL within T3: no unaligned "fast" path (that is just getX), no endianness swap in the lane.
 
-### T3 -- type-drift guard  (test/, node:test)
-Add a test (e.g. test/dts-drift.test.js) that FAILS if the .d.ts contract drifts from
-the code. It is the whole point of shipping a d.ts in this suite (BLUEPRINT lists d.ts
-drift + thrown-vs-declared code divergence as recurring finding classes; lite-bake ships
-this exact gate). Assert THREE inventories, each derived by reading the files, not hardcoded:
-  a) code-union parity: the set of `R_*` string literals in the `ReaderErrorCode` union in
-     Reader.d.ts EQUALS the set of `R_*` tags actually passed to `fail(...)`/thrown in
-     Reader.js. Extract both with a regex over the file text. Neither side may have an
-     extra. (This is what would have caught a forgotten R_DUPLICATE_FIELD/R_BAD_LENGTH.)
-  b) export parity: every `export const/function/class` name in Reader.js appears in the
-     .d.ts, and vice-versa.
-  c) VERSION parity: the `VERSION` string in Reader.js === the version in package.json.
-     (Three-place sync; the .d.ts carries no version literal, so it is exempt -- but if a
-     future .d.ts adds one, extend this assertion. Note that in decisions/.)
-Model the extraction on lite-bake's inventory gate if present (../LiteBake).
+### T4 -- Variable-length fields: bytes(row, id) 2-arg overload  (Reader.js, additive)
+A field can declare a sibling field that carries its run length; `bytes(row, id)` reads that
+length and returns the borrowed span -- blob/string fields without a hardcoded len.
+  - SCHEMA: a field may carry an optional `lengthField` (a name or id of another field whose
+    integer value at the same row is the byte length). NO new type code -- the field keeps a
+    normal type for its length-source, and the variable field is marked by `lengthField` presence.
+    Confirm the exact descriptor shape against how a caller models a blob (planner decides;
+    record in decisions/). Keeps the type table at 8.
+  - `bytes(row, id)` (2-arg): resolve `len` = the integer read of the lengthField at `row`, then
+    reuse the EXISTING coded bytes() door -- `R_BAD_LENGTH` if the resolved len is not a
+    non-negative integer, `R_BUFFER_TOO_SMALL` if the span overruns, `R_UNKNOWN_FIELD` if the
+    lengthField name does not resolve. NO new R_* code (union stays 10).
+  - `bytes(row, id, len)` (3-arg, explicit len) stays byte-identical. Dispatch on arguments.length.
+    The borrowed-view contract ("copy what you keep") is unchanged; still the one non-zero-GC method.
+ASSERTION: `bytes(row, id)` with a lengthField returns the same span as `bytes(row, id, explicitLen)`
+  when explicitLen equals the sibling's value; a len past the buffer throws R_BUFFER_TOO_SMALL; an
+  unknown lengthField throws R_UNKNOWN_FIELD. Union stays exactly 10 (drift gate still green).
 
-### T4 -- VERSION sync to 0.2.0
-Bump `Reader.js` VERSION "0.1.2" -> "0.2.0" and package.json "0.1.2" -> "0.2.0"
-(minor: additive .d.ts + new coded door, no breaking change). The T3(c) assertion
-enforces the two stay equal. CHANGELOG entry is S7, not here -- but leave a one-line
-note in decisions/ so S7 records BR-08 under "Fixed" and the .d.ts under "Added".
-
-### H0 -- ROADMAP housekeeping (docs, not code)
-Re-label the BR-05 and BR-06 rows in the ROADMAP findings table from "S3" to
-"S2 (FIXED)" so the table matches reality; add a one-line note that BR-08 is the sole
-remaining door finding, closed here. Leave BR-01..BR-04, BR-07 as their recorded
-"S2 FIXED" state.
+### T5 -- Reader.d.ts + VERSION sync  (REQUIRED whichever surfaces ship)
+  - Add every NEW public method/getter to Reader.d.ts: seek, f64..u8/val (T1), readRow (T2),
+    laneOf + a `Lane` descriptor interface (T3, if included), the bytes 2-arg overload + optional
+    `lengthField` on Field/the schema (T4). The dts-drift export/classMember parity gate enforces this.
+  - Bump VERSION 0.2.0 -> 0.3.0 in Reader.js AND package.json AND llms.txt (the THREE version
+    sites the release skill checks; llms.txt now carries the version after S7). Drift gate T3(c)
+    enforces Reader.js === package.json.
+  - CHANGELOG prose is NOT this session (that is the release step). Leave a decisions/ breadcrumb
+    listing what shipped so /release 0.3.0 records it under Added.
 
 ===============================================================================
 ## Torture / gate impact
 ===============================================================================
-- t2-adversarial (the door matrix): add a DETACHED source case to the source dimension
-  and assert it throws R_BAD_SOURCE, and that checkCoherence flags it (door <-> coherence
-  agreement must still hold across the now-5 source kinds). A detached buffer joins
-  {ArrayBuffer, full-span view, zero-offset partial view, nonzero-offset view, DETACHED}.
-- t9-controls: add a control proving the detached-door check has teeth AND is non-vacuous
-  (a live buffer is accepted; a detached one is rejected with R_BAD_SOURCE) -- mirrors the
-  existing Control 6 checkCoherence non-vacuity pair.
-- Reproduced-todo registry stays EMPTY (BR-08 is fixed the same session, not carried).
-- Hot-path gates (T6 zero-alloc + retained-alloc) unchanged -- no read body touched, so the
-  reviewer must confirm getF64..getU8/get/bytes are byte-identical to v0.1.2 (diff the bodies).
+- T6 (zero-alloc): EACH new hot surface gets its own 0-B/op + retained-alloc gate --
+  seek+cursor read, readRow into a reused out, and (if included) the laneOf hot loop. This is the
+  roadmap's explicit rule: "Each new surface gets its own T6 zero-alloc + retained-alloc gate."
+- T5 (differential): add cursor-vs-getX (T1) and, if T3 ships, the fast-lane-vs-getX differential
+  across the alignment x endianness x type matrix -- the centrepiece proof for T3.
+- T2 door matrix / T1 degenerate: add boundary cases -- a too-short readRow out; laneOf on an
+  unaligned field and on a big-endian reader (expect null); bytes(row,id) with a bad/oversized
+  lengthField value.
+- t9 controls: teeth for the new checks -- a mutated elemStride makes the T3 differential fail; a
+  too-short out is rejected; the reproduced-todo registry stays EMPTY (all fixed same session).
+- The pinned core (getF64..getU8/get/bytes-3arg) stays byte-identical -- reviewer diffs vs v0.2.0.
 
 ===============================================================================
 ## DONE WHEN
 ===============================================================================
-1. Detached ArrayBuffer (and view over a detached buffer) -> R_BAD_SOURCE, greppable code,
-   fails safely; verified by probe2.mjs re-run + a boundary test in Reader.test.js.
-2. Reader.d.ts exists, ASCII-clean, no tool-call tags, covers the full runtime surface, and
-   resolves in `npm pack` (ships as a file).
-3. test/dts-drift.test.js passes AND has teeth: temporarily removing one R_* from the union
-   or one export makes it fail (prove non-vacuity, or add a t9-style control).
-4. VERSION 0.2.0 in Reader.js AND package.json; drift guard enforces equality.
-5. `npm run verify` green (test + torture + controls); LBR_TORTURE_BREAK=1 exits 1.
-6. The 9 numeric read bodies + get + bytes are byte-identical to v0.1.2 (reviewer diff).
-7. ROADMAP findings table re-labeled (H0); decisions/ records: BR-08 -> R_BAD_SOURCE
-   rationale, detached-detection technique chosen, and the drift-guard's three inventories.
+1. Chosen surfaces land, each ADDITIVE, with the 9 numeric bodies + get + 3-arg bytes byte-identical
+   to v0.2.0 (reviewer diff).
+2. Every new public member is in Reader.d.ts AND test/dts-drift.test.js is green (export + member parity).
+3. R_* union is still EXACTLY 10 and the type table still EXACTLY 8 (drift gate asserts both).
+4. Each new hot surface proven 0 B/op + 0 retained (its own T6 gate); LBR_TORTURE_BREAK=1 exits 1.
+5. If T3 ships: laneOf reads are byte-identical to getX on every eligible cell (T5 differential),
+   laneOf returns null on unaligned/big-endian, and a mutated elemStride FAILS the differential (t9).
+6. VERSION 0.3.0 in Reader.js + package.json + llms.txt; drift guard enforces Reader.js === package.json.
+7. `npm run verify` green (test + torture + controls). decisions/ records: the cursor checked/unchecked
+   choice, the readRow out-shape + object-form defer, the lane eligibility rule + API shape, and the
+   variable-length descriptor (why no new type/R_* code).
 
 ===============================================================================
-## NON-GOALS (guard against scope creep -- these are later sessions)
+## NON-GOALS (later sessions -- guard against scope creep)
 ===============================================================================
-- No new read features / API sugar (seek, readRow, typed-lane fast path) -- that is S4.
-- No cooperation tests against real lite-bake / lite-bake-stream buffers -- that is S5.
-- No README / llms.txt / CHANGELOG prose -- that is S7 (only leave a decisions/ breadcrumb).
-- No per-read bounds checks on the typed getters. No write path. No schema mutation.
+- No cooperation tests against REAL lite-bake / lite-bake-stream buffers -- that is S5 (v0.4.0),
+  independent of S4 and can run before or after it.
+- No lite-query streaming adapter -- that is S6, and it depends on S5.
+- No README / llms.txt / CHANGELOG prose beyond the VERSION bump + a decisions/ breadcrumb -- the
+  narrative lands at /release time.
+- No write path, no schema mutation, no per-read bounds checks on getX or the cursor reads.
+- No new R_* code and no new type code -- both unions are frozen invariants this session preserves.

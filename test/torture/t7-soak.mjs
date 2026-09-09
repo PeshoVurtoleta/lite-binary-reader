@@ -38,9 +38,9 @@ const COUNT = 64;
 const NOOP = function () {};
 
 const SCHEMA = [
-  { name: 'a', type: 1, offset: 0 },  // F64
-  { name: 'b', type: 5, offset: 8 },  // U32
-  { name: 'c', type: 6, offset: 12 }, // U16
+  { name: 'a', type: 1, offset: 0 },                    // F64
+  { name: 'n', type: 7, offset: 8 },                    // U8 run-length source
+  { name: 'blob', type: 7, offset: 9, lengthField: 'n' }, // U8 variable-length span
 ];
 const STRIDE = 14;
 
@@ -50,34 +50,47 @@ export async function run() {
   const prng = makePrng(SEED);
   const tracker = createLeakTracker({ name: 'lbr-soak' });
   const sink = new Float64Array(1);
+  const rowOut = new Array(SCHEMA.length); // one reused readRow sink for the soak
 
   const buf = new ArrayBuffer(STRIDE * COUNT);
   const dv = new DataView(buf);
+  const u8 = new Uint8Array(buf);
 
   // One-sided reachability census: WeakRefs to discarded readers and dropped
   // borrowed views from the tail cycles. No strong ref survives the loop body.
   const censusRefs = [];
 
   for (let c = 0; c < CYCLES; c++) {
-    // Churn the buffer contents in place (not a fresh backing store).
+    // Churn the buffer contents in place (not a fresh backing store). The run
+    // length `n` is clamped to 0..3 so the variable-length span at 'blob' stays
+    // inside the buffer for every row (including the last).
     for (let i = 0; i < COUNT; i++) {
       const b = i * STRIDE;
       dv.setFloat64(b + 0, (prng() % 100000) * 0.25 - 5000, true);
-      dv.setUint32(b + 8, prng() >>> 0, true);
-      dv.setUint16(b + 12, prng() & 0xffff, true);
+      u8[b + 8] = prng() & 3;                 // n
+      for (let k = 0; k < 3; k++) u8[b + 9 + k] = prng() & 0xff; // blob bytes
     }
 
     const r = new LiteBinaryReader(buf, { schema: SCHEMA });
 
-    // Read every cell; accumulate to defeat dead-code elimination.
+    // Cursor scan: seek each row once, read fields off the cursor. Accumulate to
+    // defeat dead-code elimination.
     for (let k = 0; k < r.count; k++) {
-      sink[0] += r.getF64(k, 0) + r.getU32(k, 1) + r.getU16(k, 2);
+      r.seek(k);
+      sink[0] += r.f64(0) + r.u8(1) + r.val(2);
     }
 
-    // Take a borrowed bytes() view and drop it -- proving a kept view is the
-    // caller's choice, not a leak. (bytes() over row 0 field 'b', 4 bytes.)
-    const borrowed = r.bytes(0, 1, 4);
-    sink[0] += borrowed[0];
+    // readRow into ONE reused, caller-owned out sink -- no record allocated.
+    for (let k = 0; k < r.count; k++) {
+      r.readRow(k, rowOut);
+      sink[0] += rowOut[0] + rowOut[1] + rowOut[2];
+    }
+
+    // Take a borrowed variable-length bytes() VIEW (the 2-arg form, length read
+    // from the 'n' sibling) and drop it -- proving a kept view is the caller's
+    // choice, not a leak. The census below watches these dropped views.
+    const borrowed = r.bytes(0, 2);
+    sink[0] += borrowed.length;
 
     // Read-fidelity holds this cycle.
     if ((c & 511) === 0) {

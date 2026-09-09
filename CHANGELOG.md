@@ -2,6 +2,35 @@
 
 All notable changes to `@zakkster/lite-binary-reader`.
 
+## 0.3.0
+
+### Added
+- Row cursor: `seek(row)` (chainable, returns `this`) plus `f64`/`f32`/`i32`/`u32`/
+  `i16`/`u16`/`i8`/`u8(fieldId)` and `val(fieldId)`, which read at the seeked row
+  without re-passing it. The cursor read bodies inline the same address arithmetic
+  as `getF64`..`getU8`/`get`; each is zero-allocation in steady state.
+- `readRow(row, out)`: fills a caller-owned sink indexed by field id (`Array` or any
+  `TypedArray`), no record object materialized; returns `out`. A sink that is null,
+  has no numeric `length`, or is shorter than `fieldCount` throws `R_BAD_LENGTH`
+  before any write.
+- Variable-length `bytes(row, fieldId)`: a two-argument overload that resolves the
+  span length from a sibling field named by a new optional `lengthField` on a schema
+  field. Dispatched on `len === undefined`; the resolved length flows through the
+  existing `R_BAD_LENGTH` / `R_BUFFER_TOO_SMALL` doors. The three-argument
+  `bytes(row, fieldId, len)` is unchanged.
+- `Reader.d.ts`: declarations for `seek`, the eight cursor reads, `val`, `readRow`,
+  the two-argument `bytes` overload, and the optional `Field.lengthField`.
+
+### Changed
+- Test count 49 -> 60 (cursor/`readRow`/variable-length boundary and adversarial
+  cases, including nonzero-base and partial-view sources, `readRow` door and
+  reentrancy, and out-of-contract-row fail-closed).
+- Torture: a t5 cursor-vs-`getX` differential, dedicated t6 zero-alloc + retained
+  gates for the cursor and `readRow` surfaces, and t9 controls for the cursor,
+  the `readRow` door, and the variable-length span.
+- The drift gate now also asserts the type-code table stays at 8 entries, alongside
+  the existing exactly-10 `R_*` union check.
+
 ## 0.2.0
 
 ### Added

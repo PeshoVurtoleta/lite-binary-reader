@@ -193,4 +193,72 @@ export function run() {
   try { emptyReader = new LiteBinaryReader(emptyBuf, { schema: [{ name: 'x', type: T_U8, offset: 0 }] }); }
   catch (e) { die('t9 control 10: a zero-length (NOT detached) buffer was wrongly rejected as detached (' + (e && e.code) + ')'); }
   if (emptyReader.count !== 0) die('t9 control 10: a zero-length buffer did not derive count 0 (' + emptyReader.count + ')');
+
+  // --- Control 11: the row cursor has teeth. seek(row).f64(0) equals
+  // getF64(row,0) on a clean read (non-vacuity); an off-by-one seek diverges from
+  // getF64(row,0) (teeth) -- proving the cursor actually keys on _cursor and is
+  // not silently reading a fixed row. -------------------------------------------
+  const c11Buf = new ArrayBuffer(8 * 16);
+  const c11Dv = new DataView(c11Buf);
+  for (let i = 0; i < 16; i++) c11Dv.setFloat64(i * 8, i * 3.5 - 2, true); // all distinct
+  const c11 = new LiteBinaryReader(c11Buf, { schema: [{ name: 'x', type: T_F64, offset: 0 }] });
+  for (let i = 0; i < 16; i++) {
+    if (!Object.is(c11.seek(i).f64(0), c11.getF64(i, 0))) {
+      die('t9 control 11: seek(' + i + ').f64(0) did not equal getF64(' + i + ',0) (cursor broken/vacuous)');
+    }
+  }
+  let c11Diverged = false;
+  for (let i = 0; i < 15; i++) if (!Object.is(c11.seek(i + 1).f64(0), c11.getF64(i, 0))) { c11Diverged = true; break; }
+  if (!c11Diverged) die('t9 control 11: an off-by-one cursor seek did not diverge from getF64 (no teeth)');
+
+  // --- Control 12: readRow's length door prevents a measured alloc. Writing 8
+  // fields into a too-short (length-0) Array AUTO-GROWS it -- a per-iteration
+  // allocation the retained-alloc gate rejects (teeth); writing into a reused
+  // length-8 Array retains nothing and passes (non-vacuity). readRow's
+  // R_BAD_LENGTH door refuses the length-0 sink up front, so that measured alloc
+  // can never happen through the API. ------------------------------------------
+  const c12Sink = [];
+  const c12Grow = runAllocsGate((i) => {
+    const a = []; // a fresh length-0 array
+    for (let j = 0; j < 8; j++) a[j] = i + j; // grow 0 -> 8: allocation
+    c12Sink.push(a); // retain it so the growth survives a forced collection
+  }, { iterations: 50000, batches: 8 });
+  if (c12Grow.ok) {
+    die('t9 control 12: 8 writes growing a length-0 array passed the retained-alloc gate (no teeth) -- bytesPerCall=' + c12Grow.bytesPerCall);
+  }
+  c12Sink.length = 0;
+  const c12Fixed = new Array(8);
+  const c12Ok = runAllocsGate((i) => {
+    for (let j = 0; j < 8; j++) c12Fixed[j] = i + j; // no growth, no retain
+  }, { iterations: 50000, batches: 8 });
+  if (!c12Ok.ok) {
+    die('t9 control 12: 8 writes into a reused length-8 array failed the retained-alloc gate (vacuous) -- verdict=' +
+      c12Ok.report.verdict + ' settled=' + c12Ok.result.settled + ' bytesPerCall=' + c12Ok.bytesPerCall);
+  }
+
+  // --- Control 13: the variable-length bytes(row,id) has teeth. With a
+  // lengthField, bytes(row,id) equals bytes(row,id,len) for the sibling's value
+  // (non-vacuity); +1 on the length CELL changes the span length by exactly 1
+  // (teeth); a length past the buffer throws R_BUFFER_TOO_SMALL. ----------------
+  const c13Schema = [
+    { name: 'len', type: T_U8, offset: 0 },
+    { name: 'blob', type: T_U8, offset: 1, lengthField: 'len' },
+  ];
+  const c13Buf = new ArrayBuffer(16);
+  const c13Dv = new DataView(c13Buf);
+  c13Dv.setUint8(0, 4); // len = 4
+  for (let k = 0; k < 8; k++) c13Dv.setUint8(1 + k, k + 1);
+  const c13 = new LiteBinaryReader(c13Buf, { schema: c13Schema, count: 1 });
+  const c13Auto = c13.bytes(0, 1);
+  const c13Explicit = c13.bytes(0, 1, 4);
+  if (c13Auto.length !== 4 || c13Explicit.length !== 4) {
+    die('t9 control 13: bytes(row,id) length did not match the lengthField value (vacuous/broken)');
+  }
+  for (let k = 0; k < 4; k++) if (c13Auto[k] !== c13Explicit[k]) die('t9 control 13: 2-arg and 3-arg bytes spans diverged (vacuous/broken)');
+  c13Dv.setUint8(0, 5); // bump the length cell by 1
+  if (c13.bytes(0, 1).length !== 5) die('t9 control 13: bumping the length cell did not change the span length (no teeth)');
+  c13Dv.setUint8(0, 255); // a length far past the 16-byte buffer
+  let c13Code = null;
+  try { c13.bytes(0, 1); } catch (e) { c13Code = e && e.code; }
+  if (c13Code !== 'R_BUFFER_TOO_SMALL') die('t9 control 13: a length past the buffer did not throw R_BUFFER_TOO_SMALL (got ' + c13Code + ')');
 }
