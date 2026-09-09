@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lite-binary-reader -- layout visuals</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0b0f10; color: #cfe8d8;
+    font: 14px/1.55 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; align-items: center; padding: 24px 16px 60px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; color: #eafff2; letter-spacing: .5px; }
+  h2 { font-size: 15px; margin: 6px 0 2px; color: #eafff2; }
+  .sub { color: #6f8f7f; margin: 0 0 8px; text-align: center; max-width: 820px; }
+  .sub code, code { color: #9fe3bf; }
+  section { width: 100%; max-width: 900px; border: 1px solid #1d2b25; border-radius: 10px; padding: 18px 20px 22px; margin-top: 22px; background: #0c1512; }
+  .cap { color: #7fa591; font-size: 12.5px; margin: 4px 0 14px; }
+  .cap b { color: #cfe8d8; }
+  .row { display: flex; flex-wrap: wrap; gap: 22px; align-items: flex-start; }
+  .col { flex: 1 1 320px; min-width: 300px; }
+  svg { max-width: 100%; height: auto; display: block; }
+  canvas { display: block; border-radius: 8px; border: 1px solid #1d2b25; background: #04120c; }
+  .args { font-size: 12px; color: #8fb3a1; background: #07110c; border: 1px solid #163; border-radius: 6px; padding: 10px 12px; margin-top: 10px; white-space: pre; overflow-x: auto; }
+  .args .ok { color: #37e08a; } .args .no { color: #ff8a6a; }
+  button { font: inherit; font-size: 12.5px; background: #12261c; color: #9fe3bf; border: 1px solid #275; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+  button:hover { background: #17301f; }
+  button.on { background: #113; border-color: #46f; color: #bcd0ff; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; color: #8fb3a1; margin: 6px 0 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .foot { margin-top: 26px; color: #46604f; font-size: 11px; text-align: center; max-width: 820px; }
+  .val { color: #ffcf5a; }
+</style>
+</head>
+<body>
+  <h1>lite-binary-reader &mdash; layout visuals</h1>
+  <p class="sub">
+    Every grid below is generated from the reader's <b>actual</b> <code>schema</code> offsets,
+    field types and <code>stride</code> at runtime &mdash; not hand-drawn. Every decoded number is a
+    real reader read. Served with <code>npx serve demo</code>; imports only <code>../Reader.js</code>.
+  </p>
+
+  <!-- ================= V1: laneOf -> GPU ================= -->
+  <section>
+    <h2>1. <code>laneOf()</code> &rarr; GPU: the zero-copy hand-off</h2>
+    <p class="cap">
+      An interleaved vertex buffer (AoS, <b>stride 20</b>) is exactly what a mesh loader or GPU
+      readback hands you. <code>laneOf()</code> proves it is host-endian and aligned &mdash; i.e.
+      uploadable as-is &mdash; and yields the exact <code>gl.vertexAttribPointer</code> arithmetic.
+      The canvas uploads <code>reader.buffer</code> straight to <code>bufferData</code>:
+      <b>no JS-side repack, no unpack loop, no allocation.</b>
+    </p>
+    <div class="legend" id="v1legend"></div>
+    <div class="row">
+      <div class="col">
+        <div id="v1grid"></div>
+        <div class="args" id="v1args"></div>
+      </div>
+      <div class="col" style="flex:0 0 260px; min-width:260px;">
+        <canvas id="gl" width="260" height="260"></canvas>
+        <p class="cap" style="margin-top:8px;">The same bytes, drawn by WebGL. Position is a
+          <code>vec3</code> of 3 consecutive <code>f32</code> fields; color a normalized
+          <code>vec4</code> of 4 <code>u8</code> fields &mdash; composed from scalar lanes,
+          contiguity verified.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= V2: unaligned BE + padding reframe ================= -->
+  <section>
+    <h2>2. The unaligned big-endian read &mdash; and the padding reframe</h2>
+    <p class="cap">
+      A foreign wire record (<b>stride 8</b>): <code>u8 kind@0</code>, <code>f32 value@1</code>
+      (<b>unaligned</b>), <code>u16 seq@5</code>, big-endian. A <code>Float32Array</code> cannot
+      begin at byte 1; the reader can. Toggle how the 4 value-bytes are interpreted &mdash; it is a
+      real read through a reader built for that endianness.
+    </p>
+    <div class="legend" id="v2legend"></div>
+    <div id="v2grid"></div>
+    <p class="cap" style="margin-top:10px;">
+      <button id="v2endian" class="on">Read as: big-endian (wire)</button>
+      &nbsp; <code>value</code> (bytes 1&ndash;4) decodes to <span class="val" id="v2val"></span>
+    </p>
+
+    <h2 style="margin-top:20px;">The padding reframe</h2>
+    <p class="cap">
+      The usual "wasted bytes in red" trope does not fit this library &mdash; its tight layouts often
+      have <b>no</b> padding. The true, reader-specific contrast: exposing <code>value</code> as a
+      <code>Float32Array</code> <b>lane</b> would REQUIRE padding it to a 4-aligned offset (red gap
+      bytes). The reader reads the tight, unaligned layout with <b>no gaps at all</b>.
+    </p>
+    <div class="row">
+      <div class="col"><div style="color:#8fb3a1;font-size:12px;margin-bottom:6px;">tight, unaligned (what the reader reads) &mdash; stride 8</div><div id="v2tight"></div></div>
+      <div class="col"><div style="color:#8fb3a1;font-size:12px;margin-bottom:6px;">4-aligned (what a typed-array lane would need) &mdash; stride 12</div><div id="v2pad"></div></div>
+    </div>
+  </section>
+
+  <p class="foot">demo/visuals.html &mdash; repo-only, not in the npm tarball. Grids are rendered from
+    the reader's live <code>typeOf</code>/<code>offsetOf</code>/<code>stride</code>; the WebGL scene
+    uploads the reader's own <code>ArrayBuffer</code>.</p>
+
+<script type="module">
+import { LiteBinaryReader, T_F32, T_U8, T_U16, T_U64, IS_LITTLE_ENDIAN } from "../Reader.js";
+
+// Canonical per-type byte widths + a human label, indexed by type code. Used ONLY
+// to size and color the grid cells; the offsets/types/stride themselves come from
+// the live reader, so the picture is the actual layout the reader reads.
+const TYPE_BYTES = [4, 8, 4, 2, 1, 4, 2, 1, 8, 8];
+const TYPE_NAME = ["f32", "f64", "i32", "i16", "i8", "u32", "u16", "u8", "i64", "u64"];
+const PALETTE = ["#37e08a", "#4fd0ff", "#ffcf5a", "#c78bff", "#ff8a6a", "#7fe0c0", "#f0a0d0"];
+
+// WebGL attribute enums keyed by the typed array a lane exposes. No f64/i64/u64:
+// WebGL has no double or 64-bit vertex attribute (the honest decline case).
+const GL_TYPE = new Map([
+  [Float32Array, "gl.FLOAT"], [Int8Array, "gl.BYTE"], [Uint8Array, "gl.UNSIGNED_BYTE"],
+  [Int16Array, "gl.SHORT"], [Uint16Array, "gl.UNSIGNED_SHORT"], [Int32Array, "gl.INT"], [Uint32Array, "gl.UNSIGNED_INT"],
+]);
+
+// ---- byte-grid renderer: derives every span from the LIVE reader ----------
+// fields: [{ name, id, color }]. Renders `rows` records of `stride` byte-cells,
+// coloring each field's span, from reader.offsetOf / reader.typeOf / reader.stride.
+function grid(reader, fields, { rows = Math.min(reader.count, 3), cell = 26, pad = { r: false } } = {}) {
+  const stride = reader.stride;
+  const gap = 3, labelH = 18, left = 26;
+  const w = left + stride * (cell + gap);
+  const h = labelH + rows * (cell + gap) + 6;
+  let s = `<svg viewBox="0 0 ${w} ${h}" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,monospace">`;
+  // byte-offset ruler
+  for (let b = 0; b < stride; b++) {
+    const x = left + b * (cell + gap);
+    s += `<text x="${x + cell / 2}" y="12" fill="#5f7f6f" font-size="9" text-anchor="middle">${b}</text>`;
+  }
+  // per-field span map for coloring
+  const owner = new Array(stride).fill(null);
+  for (const f of fields) {
+    const off = reader.offsetOf(f.id), width = TYPE_BYTES[reader.typeOf(f.id)];
+    for (let b = off; b < off + width; b++) owner[b] = f;
+  }
+  for (let r = 0; r < rows; r++) {
+    const y = labelH + r * (cell + gap);
+    s += `<text x="0" y="${y + cell / 2 + 3}" fill="#5f7f6f" font-size="9">r${r}</text>`;
+    for (let b = 0; b < stride; b++) {
+      const x = left + b * (cell + gap);
+      const f = owner[b];
+      const isPad = f === null && pad.r;
+      const fill = f ? f.color + "33" : (isPad ? "#ff3b3b22" : "#0e1a14");
+      const stroke = f ? f.color : (isPad ? "#ff3b3b" : "#1c2b24");
+      s += `<rect x="${x}" y="${y}" width="${cell}" height="${cell}" rx="3" fill="${fill}" stroke="${stroke}" stroke-width="1"/>`;
+      if (isPad) s += `<text x="${x + cell / 2}" y="${y + cell / 2 + 3}" fill="#ff6a5a" font-size="9" text-anchor="middle">pad</text>`;
+    }
+  }
+  return s + `</svg>`;
+}
+
+function legend(el, fields) {
+  el.innerHTML = fields.map((f) =>
+    `<span><span class="sw" style="background:${f.color}"></span>${f.name} <code>${f.tn}</code>@${f.off}</span>`).join("");
+}
+
+function describe(reader, names, palette) {
+  return names.map((nm, i) => {
+    const id = reader.field(nm);
+    return { name: nm, id, color: palette[i % palette.length], off: reader.offsetOf(id), tn: TYPE_NAME[reader.typeOf(id)] };
+  });
+}
+
+// ============================================================================
+// V1 -- interleaved VBO: laneOf -> vertexAttribPointer + live WebGL upload
+// ============================================================================
+const STRIDE = 20, VERTS = 3;
+const vbuf = new ArrayBuffer(STRIDE * VERTS);
+const vdv = new DataView(vbuf);
+// A visible triangle in clip space; colors as normalized u8.
+const mesh = [
+  { x: -0.6, y: -0.5, z: 0, r: 255, g: 60, b: 60, a: 255, u: 0, v: 0 },
+  { x: 0.6, y: -0.5, z: 0, r: 60, g: 230, b: 120, a: 255, u: 65535, v: 0 },
+  { x: 0.0, y: 0.6, z: 0, r: 90, g: 150, b: 255, a: 255, u: 32768, v: 65535 },
+];
+for (let i = 0; i < VERTS; i++) {
+  const b = i * STRIDE;
+  vdv.setFloat32(b, mesh[i].x, IS_LITTLE_ENDIAN); vdv.setFloat32(b + 4, mesh[i].y, IS_LITTLE_ENDIAN); vdv.setFloat32(b + 8, mesh[i].z, IS_LITTLE_ENDIAN);
+  vdv.setUint8(b + 12, mesh[i].r); vdv.setUint8(b + 13, mesh[i].g); vdv.setUint8(b + 14, mesh[i].b); vdv.setUint8(b + 15, mesh[i].a);
+  vdv.setUint16(b + 16, mesh[i].u, IS_LITTLE_ENDIAN); vdv.setUint16(b + 18, mesh[i].v, IS_LITTLE_ENDIAN);
+}
+const vbo = new LiteBinaryReader(vbuf, {
+  schema: [
+    { name: "x", type: T_F32, offset: 0 }, { name: "y", type: T_F32, offset: 4 }, { name: "z", type: T_F32, offset: 8 },
+    { name: "r", type: T_U8, offset: 12 }, { name: "g", type: T_U8, offset: 13 }, { name: "b", type: T_U8, offset: 14 }, { name: "a", type: T_U8, offset: 15 },
+    { name: "u", type: T_U16, offset: 16 }, { name: "v", type: T_U16, offset: 18 },
+  ],
+  stride: STRIDE, littleEndian: IS_LITTLE_ENDIAN,
+});
+const vFields = describe(vbo, ["x", "y", "z", "r", "g", "b", "a", "u", "v"], PALETTE);
+legend(document.getElementById("v1legend"), vFields);
+document.getElementById("v1grid").innerHTML = grid(vbo, vFields);
+
+// Compose a vecN attribute from consecutive scalar lanes; verify contiguity.
+function attribOf(reader, names, normalized) {
+  const first = reader.field(names[0]);
+  const lane = reader.laneOf(first);
+  if (!lane) return { ok: false, why: "laneOf declined (opposite-endian / unaligned)" };
+  const glName = GL_TYPE.get(lane.view.constructor);
+  if (!glName) return { ok: false, why: `${lane.view.constructor.name}: no WebGL attribute type` };
+  const width = lane.view.BYTES_PER_ELEMENT, t0 = reader.typeOf(first), off0 = reader.offsetOf(first);
+  for (let k = 1; k < names.length; k++) {
+    const id = reader.field(names[k]);
+    if (reader.typeOf(id) !== t0 || reader.offsetOf(id) !== off0 + k * width)
+      return { ok: false, why: `${names[k]} not a contiguous same-type component` };
+  }
+  return { ok: true, size: names.length, glName, normalized, stride: lane.elemStride * width, offset: lane.elemOffset * width, glType: GL_TYPE.get(lane.view.constructor), ctor: lane.view.constructor };
+}
+const posA = attribOf(vbo, ["x", "y", "z"], false);
+const colA = attribOf(vbo, ["r", "g", "b", "a"], true);
+document.getElementById("v1args").innerHTML =
+  `<span class="ok">// upload reader.buffer (${vbo.buffer.byteLength} B) straight to bufferData -- 0 repack</span>\n` +
+  `position: gl.vertexAttribPointer(0, ${posA.size}, ${posA.glName}, ${posA.normalized}, ${posA.stride}, ${posA.offset})\n` +
+  `color:    gl.vertexAttribPointer(1, ${colA.size}, ${colA.glName}, ${colA.normalized}, ${colA.stride}, ${colA.offset})\n` +
+  `<span class="ok">// 0 copies, 0 unpack loops, 0 allocations in JS</span>`;
+
+// ---- live WebGL: upload the reader's buffer as-is, draw the triangle -------
+const gl = document.getElementById("gl").getContext("webgl");
+if (gl && posA.ok && colA.ok) {
+  const vs = `attribute vec3 position; attribute vec4 color; uniform float angle; varying vec4 vColor;
+    void main(){ float c=cos(angle),s=sin(angle); mat2 R=mat2(c,-s,s,c);
+      gl_Position=vec4(R*position.xy,0.0,1.0); vColor=color; }`;
+  const fs = `precision mediump float; varying vec4 vColor; void main(){ gl_FragColor=vColor; }`;
+  const sh = (t, src) => { const o = gl.createShader(t); gl.shaderSource(o, src); gl.compileShader(o); return o; };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(prog); gl.useProgram(prog);
+  const glbuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, glbuf);
+  gl.bufferData(gl.ARRAY_BUFFER, vbo.buffer, gl.STATIC_DRAW);   // <- reader.buffer, uploaded as-is
+  const pLoc = gl.getAttribLocation(prog, "position"), cLoc = gl.getAttribLocation(prog, "color");
+  gl.enableVertexAttribArray(pLoc);
+  gl.vertexAttribPointer(pLoc, posA.size, gl[posA.glName.split(".")[1]], posA.normalized, posA.stride, posA.offset);
+  gl.enableVertexAttribArray(cLoc);
+  gl.vertexAttribPointer(cLoc, colA.size, gl[colA.glName.split(".")[1]], colA.normalized, colA.stride, colA.offset);
+  const aLoc = gl.getUniformLocation(prog, "angle");
+  gl.clearColor(0.016, 0.07, 0.047, 1);
+  let angle = 0;                                 // a number; no per-frame allocation
+  const frame = () => {
+    angle += 0.01;
+    gl.uniform1f(aLoc, angle);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLES, 0, VERTS);
+    requestAnimationFrame(frame);
+  };
+  frame();
+}
+
+// ============================================================================
+// V2 -- unaligned big-endian record + the padding reframe
+// ============================================================================
+const W_STRIDE = 8, W_ROWS = 3;
+const wbuf = new ArrayBuffer(W_STRIDE * W_ROWS);
+const wdv = new DataView(wbuf);
+const wsamples = [{ kind: 1, value: 3.5, seq: 1000 }, { kind: 2, value: -12.25, seq: 1001 }, { kind: 7, value: 99.5, seq: 1002 }];
+for (let i = 0; i < W_ROWS; i++) {
+  const b = i * W_STRIDE;
+  wdv.setUint8(b, wsamples[i].kind);
+  wdv.setFloat32(b + 1, wsamples[i].value, false); // BIG-endian at odd offset 1
+  wdv.setUint16(b + 5, wsamples[i].seq, false);
+}
+const wschema = [{ name: "kind", type: T_U8, offset: 0 }, { name: "value", type: T_F32, offset: 1 }, { name: "seq", type: T_U16, offset: 5 }];
+// Two readers over the SAME bytes -- one BE (the true wire), one LE -- so the toggle
+// is a real reinterpret, not a fake relabel.
+const wBE = new LiteBinaryReader(wbuf, { schema: wschema, stride: W_STRIDE, littleEndian: false });
+const wLE = new LiteBinaryReader(wbuf, { schema: wschema, stride: W_STRIDE, littleEndian: true });
+const wFields = describe(wBE, ["kind", "value", "seq"], [PALETTE[2], PALETTE[1], PALETTE[0]]);
+legend(document.getElementById("v2legend"), wFields);
+document.getElementById("v2grid").innerHTML = grid(wBE, wFields);
+
+const VAL = wBE.field("value");
+const v2val = document.getElementById("v2val"), v2btn = document.getElementById("v2endian");
+let asBE = true;
+function showVal() {
+  const r = asBE ? wBE : wLE;
+  v2val.textContent = `${r.getF32(0, VAL)}  (${asBE ? "big-endian" : "little-endian"} read of the same 4 bytes)`;
+}
+v2btn.onclick = () => {
+  asBE = !asBE;
+  v2btn.textContent = asBE ? "Read as: big-endian (wire)" : "Read as: little-endian (host)";
+  v2btn.classList.toggle("on", asBE);
+  showVal();
+};
+showVal();
+
+// Padding reframe: tight (reader) vs 4-aligned (typed-array lane would need).
+document.getElementById("v2tight").innerHTML = grid(wBE, wFields, { rows: 1 });
+// The aligned layout: value padded to offset 4, so a Float32Array lane is legal.
+const abuf = new ArrayBuffer(12 * W_ROWS);
+const aschema = [{ name: "kind", type: T_U8, offset: 0 }, { name: "value", type: T_F32, offset: 4 }, { name: "seq", type: T_U16, offset: 8 }];
+const aRdr = new LiteBinaryReader(abuf, { schema: aschema, stride: 12, littleEndian: IS_LITTLE_ENDIAN });
+const aFields = describe(aRdr, ["kind", "value", "seq"], [PALETTE[2], PALETTE[1], PALETTE[0]]);
+document.getElementById("v2pad").innerHTML = grid(aRdr, aFields, { rows: 1, pad: { r: true } });
+</script>
+</body>
+</html>

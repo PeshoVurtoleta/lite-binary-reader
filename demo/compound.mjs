@@ -63,21 +63,47 @@ const C_PARENT = cr.field("parentId");
 const C_SKU = cr.field("sku");
 const C_QTY = cr.field("qty");
 
-// Index children by parent key ONCE (a cold, caller-side map). The reads are zero-GC.
+// Index children by parent key ONCE (a cold, caller-side map, built with the row
+// cursor). This map is the only allocation in the join, and it is amortized.
 const byParent = new Map();
 for (let c = 0; c < cr.count; c++) {
-    const key = cr.get(c, C_PARENT);
+    const key = cr.seek(c).u32(C_PARENT);
     let bucket = byParent.get(key);
     if (!bucket) { bucket = []; byParent.set(key, bucket); }
     bucket.push(c);
 }
 
+// 2a. The HOT join: walk parents on the cursor, fill each child into ONE reusable
+// caller-owned sink, accumulate. No per-row temp object, no .map(), no closure --
+// the read/join/accumulate path allocates NOTHING per row.
+const itemOut = new Array(cr.fieldCount);        // one sink, reused for every child row
+let grandUnits = 0;                              // proof the hot path ran and read real bytes
 for (let p = 0; p < pr.count; p++) {
-    const orderId = pr.get(p, P_ORDER);
-    const total = pr.get(p, P_TOTAL);
-    const items = (byParent.get(orderId) || []).map((c) => `sku ${cr.get(c, C_SKU)} x${cr.get(c, C_QTY)}`);
-    line(`  order ${orderId} ($${(total / 100).toFixed(2)}): ${items.join(", ")}`);
+    const orderId = pr.seek(p).u32(P_ORDER);     // cursor read on the parent scan
+    const bucket = byParent.get(orderId);
+    if (bucket) for (let k = 0; k < bucket.length; k++) {
+        cr.readRow(bucket[k], itemOut);          // itemOut[fieldId] = field; no allocation
+        grandUnits += itemOut[C_QTY];
+    }
 }
+
+// 2b. The COLD print. Human-readable strings allocate BY NECESSITY -- that is
+// rendering, not reading. It is kept structurally SEPARATE from the hot path above
+// so the "zero-GC" claim lands only where it is true: on the read/join, not on the
+// string building. (It reuses the same `itemOut` sink -- still no per-row object.)
+for (let p = 0; p < pr.count; p++) {
+    const orderId = pr.seek(p).u32(P_ORDER);
+    const total = pr.u32(P_TOTAL);
+    const bucket = byParent.get(orderId) || [];
+    let parts = "";
+    for (let k = 0; k < bucket.length; k++) {
+        cr.readRow(bucket[k], itemOut);
+        parts += (k ? ", " : "") + `sku ${itemOut[C_SKU]} x${itemOut[C_QTY]}`;
+    }
+    line(`  order ${orderId} ($${(total / 100).toFixed(2)}): ${parts}`);
+}
+line(`  join+accumulate: ${grandUnits} total units, read via seek()+readRow into ONE reused sink`);
+line(`  (the join/accumulate above is zero-alloc; this print loop builds strings and is not)`);
 
 // ---------------------------------------------------------------------------
 // 3. lite-query: stream the child rows reactively through the reader.

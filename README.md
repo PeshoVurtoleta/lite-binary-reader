@@ -490,21 +490,27 @@ A recurring suggestion is to split the getters into hardcoded little-endian and 
 
 ## Demos
 
-Three demos live in `demo/` (repo-only -- not in the npm tarball):
+Five demos live in `demo/` (repo-only -- not in the npm tarball):
 
 ```bash
 npm run demo             # standalone (node): a foreign big-endian wire packet with an
-                         # UNALIGNED f32, read zero-GC, plus the laneOf fast path
-node demo/compound.mjs   # ecosystem pipeline (node): lite-bake bakes a parent + children
-                         # table -> one reader per table via fromBaked -> join by key
-                         # -> lite-query streamQuery decodes the rows reactively
-npm run demo:scope       # oscilloscope (browser): serves the repo; open the printed URL
-                         # at /demo/ -- a live scope decoding a packed i16 capture buffer
+                         # UNALIGNED f32, read zero-GC; the laneOf fast path; and a 64-bit
+                         # event record read via getU64/getI64 + a variable-length bytes() span
+npm run demo:compound    # ecosystem pipeline (node): lite-bake bakes a parent + children
+                         # table -> one reader per table via fromBaked -> zero-alloc join by
+                         # key (seek + readRow) -> lite-query streamQuery decodes reactively
+npm run demo:webgl       # WebGL hand-off (node): laneOf proves an interleaved buffer is
+                         # uploadable and prints the exact gl.vertexAttribPointer args
+npm run demo:scope       # browser: serves the repo; open the printed URL, then:
+                         #   /demo/           -- oscilloscope: a live i16 capture buffer
+                         #   /demo/visuals.html -- byte-grid layouts + a live WebGL upload
 ```
 
-- **Standalone** shows the reason this package exists: it reads bytes a typed-array lane and `lite-bake` cannot address (an unaligned offset, big-endian order), allocating nothing per read.
-- **Compound** is the real query-builder scenario -- `bake -> read -> reactive stream`, end to end, with the reader importing no sibling (`lite-bake` and `lite-query` are demo-only `file:` devDependencies).
-- **Oscilloscope** (`demo/index.html`) is the visual one: three `i16` channels are packed into an `ArrayBuffer` each frame like an ADC capture, and `LiteBinaryReader` decodes them into live scope traces -- the render loop reads through `laneOf()` (a raw `Int16Array` view, zero `DataView` calls per sample). A toggle switches the source to big-endian "wire" order, where `laneOf` declines and the reader byte-swaps through `getI16` instead.
+- **Standalone** shows the reason this package exists: it reads bytes a typed-array lane and `lite-bake` cannot address (an unaligned offset, big-endian order) allocating nothing per read, then exercises the two documented allocation exceptions -- `getU64`/`getI64` (a `bigint`) and the borrowed-view `bytes(row, id)` span.
+- **Compound** is the real query-builder scenario -- `bake -> read -> reactive stream`, end to end, with the reader importing no sibling (`lite-bake` and `lite-query` are demo-only `file:` devDependencies). The parent/child join is zero-alloc (`seek` + `readRow` into one reused sink), kept structurally separate from the cold string-building print.
+- **WebGL hand-off** (`demo/webgl-handoff.mjs`) is the zero-copy story: `laneOf()` proves an interleaved vertex buffer is host-endian and aligned, then hands you `byteStride = elemStride * width`, `byteOffset = elemOffset * width` -- the exact `gl.vertexAttribPointer` args to upload `reader.buffer` as-is (0 copies, 0 unpack loops). It declines honestly where GL has no attribute type (`f64`/`i64`/`u64`) or the buffer is opposite-endian.
+- **Oscilloscope** (`demo/index.html`) packs three `i16` channels into an `ArrayBuffer` each frame like an ADC capture and decodes them into live scope traces -- the render loop reads through `laneOf()` (a raw `Int16Array` view, zero `DataView` calls per sample). A toggle switches the source to big-endian "wire" order, where `laneOf` declines and the reader byte-swaps through `getI16` instead.
+- **Layout visuals** (`demo/visuals.html`) render byte grids from the reader's *live* `offsetOf`/`typeOf`/`stride` (never hand-drawn): the interleaved VBO with each field span colored and a live WebGL triangle drawn from the same buffer, and the unaligned big-endian record with an endianness-reinterpret toggle plus the padding reframe (a tight unaligned layout vs the 4-aligned padding a typed-array lane would require).
 
 ---
 

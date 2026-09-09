@@ -9,7 +9,7 @@
 //
 // Repo-only demo; not shipped in the npm tarball.
 
-import { LiteBinaryReader, T_U8, T_F32, T_U16, IS_LITTLE_ENDIAN } from "../Reader.js";
+import { LiteBinaryReader, T_U8, T_F32, T_U16, T_U64, T_I64, IS_LITTLE_ENDIAN } from "../Reader.js";
 
 const line = (s) => process.stdout.write(s + "\n");
 
@@ -92,6 +92,65 @@ if (xLane) {
 const declined = wire.laneOf(VALUE);
 line(`  wire.laneOf('value') -> ${declined} (unaligned + big-endian: laneOf declines, getX still serves it)`);
 
+// ---------------------------------------------------------------------------
+// 3. An event-log record: 64-bit ids/deltas + a variable-length tag blob.
+// ---------------------------------------------------------------------------
+// One record layout (stride 24), the kind of thing a binary log or IPC frame uses:
+//   u64 id      @0    monotonic id -- routinely past 2^53, so it CANNOT be a JS number
+//   i64 deltaNs @8    signed 64-bit time delta
+//   u8  len     @16   length of the tag that follows
+//   u8  tag     @17   variable-length ASCII tag (lengthField: "len")
+// This exercises the two SHIPPED escape hatches from the zero-GC number path:
+// getU64/getI64 (return a bigint) and the 2-arg bytes(row, id) (a borrowed view).
 line("");
-line("Nothing above allocated per read: one reader owns the DataView + schema tables,");
-line("field ids are resolved once, and every getX/lane read returns a primitive.");
+line("== 3. 64-bit fields + a variable-length tag (getU64 / getI64 / bytes) ==");
+
+const E_STRIDE = 24;
+const events = [
+    { id: 2n ** 63n + 5n, deltaNs: -1500n, tag: "boot" },
+    { id: 2n ** 63n + 6n, deltaNs: 42n, tag: "tick" },
+    { id: 2n ** 63n + 7n, deltaNs: 9007199254740993n, tag: "reset" }, // > 2^53: needs BigInt
+];
+const ebuf = new ArrayBuffer(E_STRIDE * events.length);
+const edv = new DataView(ebuf);
+const enc = new TextEncoder();
+for (let i = 0; i < events.length; i++) {
+    const base = i * E_STRIDE;
+    edv.setBigUint64(base + 0, events[i].id, IS_LITTLE_ENDIAN);
+    edv.setBigInt64(base + 8, events[i].deltaNs, IS_LITTLE_ENDIAN);
+    const tagBytes = enc.encode(events[i].tag);
+    edv.setUint8(base + 16, tagBytes.length);
+    new Uint8Array(ebuf, base + 17, tagBytes.length).set(tagBytes);
+}
+
+const log = new LiteBinaryReader(ebuf, {
+    schema: [
+        { name: "id", type: T_U64, offset: 0 },
+        { name: "deltaNs", type: T_I64, offset: 8 },
+        { name: "len", type: T_U8, offset: 16 },
+        { name: "tag", type: T_U8, offset: 17, lengthField: "len" }, // variable-length span
+    ],
+    stride: E_STRIDE,
+    littleEndian: IS_LITTLE_ENDIAN,
+});
+
+const ID = log.field("id");
+const DELTA = log.field("deltaNs");
+const TAG = log.field("tag");
+const dec = new TextDecoder();
+
+for (let r = 0; r < log.count; r++) {
+    const id = log.getU64(r, ID);       // -> a bigint (allocates); note below
+    const delta = log.getI64(r, DELTA); // -> a bigint (allocates)
+    const span = log.bytes(r, TAG);     // -> a BORROWED Uint8Array view over the tag bytes
+    line(`  event ${r}: id=${id} deltaNs=${delta} tag="${dec.decode(span)}" (${span.length}B borrowed)`);
+}
+line("  note: getU64/getI64 each allocate a BigInt -- a JS BigInt is a heap value by spec.");
+line("  This is the SECOND documented allocation exception alongside bytes(); the eight");
+line("  primitive-number lanes (getF32..getU8) remain unqualified zero-GC.");
+line("  bytes(r, TAG) returns a view that ALIASES the buffer -- copy what you keep.");
+
+line("");
+line("Sections 1-2 allocated nothing per read: one reader owns the DataView + schema");
+line("tables, field ids are resolved once, and every primitive getX/lane read returns a");
+line("number. Section 3's 64-bit reads and bytes() view are the two documented exceptions.");

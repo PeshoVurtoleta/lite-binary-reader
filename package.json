@@ -30,6 +30,7 @@
     "verify": "npm test && npm run torture && npm run torture:controls",
     "demo": "node demo/standalone.mjs",
     "demo:compound": "node demo/compound.mjs",
+    "demo:webgl": "node demo/webgl-handoff.mjs",
     "demo:scope": "npx serve .",
     "bench": "node --expose-gc bench/bench.mjs"
   },

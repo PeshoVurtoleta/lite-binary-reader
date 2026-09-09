@@ -1,4 +1,24 @@
-# Demo refresh (post-1.1.0) -- code demos + a visualization layer  [DRAFT FOR REVIEW]
+# Demo refresh (post-1.1.0) -- code demos + a visualization layer  [IMPLEMENTED]
+
+status: IMPLEMENTED (D3 accepted: one pass, T1 -> T2+V2 -> T3+V1; V3 deferred).
+Shipped this session (demo/ only, no Reader.js change, no version bump):
+  - T1  demo/compound.mjs -- zero-alloc join (seek + readRow into one reused sink),
+        separated from the cold print; honest framing. Verified: 13 units, runs clean.
+  - T2  demo/standalone.mjs -- new 64-bit event record: getU64/getI64 (bigint) + a
+        variable-length bytes(row,id) borrowed span, with the BigInt-allocation note.
+  - T3  demo/webgl-handoff.mjs (NEW) -- laneOf proves eligibility + prints exact
+        gl.vertexAttribPointer args; declines honestly for f64/i64/u64 and BE buffers.
+  - V1+V2 demo/visuals.html (NEW) -- byte grids generated from the LIVE reader
+        (offsetOf/typeOf/stride, never hand-drawn): interleaved VBO + a real WebGL
+        upload of reader.buffer; unaligned-BE record with an endianness-reinterpret
+        toggle (3.5 vs 3.45e-41 on the same 4 bytes) + the padding reframe.
+  - package.json adds `demo:webgl`; README Demos section rewritten (3 -> 5 demos).
+DEFERRED: V3 (ecosystem flow scene) -- lowest value, most generic; a later branding pass.
+Full suite still green (101/101, torture ok, controls ok) -- no module change.
+NOTE: package.json + README carry BOTH the 1.1.0 release edits and these demo edits in
+the working tree; sequence the commits as you prefer (1.1.0 first, then a demo commit).
+
+-- Original plan preserved below for reference --
 
 status: DRAFT, plan-only. Nothing implemented until you say "run it". This session
 touches ONLY `demo/` (+ possibly a new `demo/` SVG/HTML) -- `Reader.js` and the
