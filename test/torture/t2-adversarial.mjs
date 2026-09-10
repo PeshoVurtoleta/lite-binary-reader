@@ -89,6 +89,21 @@ export async function run() {
   // R_BAD_SOURCE (P10): a plain array is not an ArrayBuffer or view.
   expectCode(() => new LiteBinaryReader([1, 2, 3], { schema: okSchema }),
     'R_BAD_SOURCE', 'P10 plain array source');
+
+  // --- 2b. S10: the littleEndian door, pinned by name -------------------------
+  // Field.littleEndian must be boolean-or-absent; anything else -> R_BAD_SCHEMA
+  // (reuse, no new code). "-0" is the adversarial boundary: a NUMBER, not a
+  // boolean, so it must throw exactly like "yes"/1/0/null/NaN -- a naive
+  // truthiness check (`!fe` treating -0 like false) would wrongly accept it.
+  for (const v of ['yes', 1, 0, null, NaN, -0]) {
+    expectCode(() => new LiteBinaryReader(buf64, {
+      schema: [{ name: 'x', type: T_F64, offset: 0, littleEndian: v }],
+    }), 'R_BAD_SCHEMA', 'S10 littleEndian=' + String(v));
+  }
+  // absent, true, and false are all accepted -- NOT this door.
+  new LiteBinaryReader(buf64, { schema: [{ name: 'x', type: T_F64, offset: 0 }] });
+  new LiteBinaryReader(buf64, { schema: [{ name: 'x', type: T_F64, offset: 0, littleEndian: true }] });
+  new LiteBinaryReader(buf64, { schema: [{ name: 'x', type: T_F64, offset: 0, littleEndian: false }] });
   // R_BAD_SOURCE (BR-08): a DETACHED ArrayBuffer, and a view over a detached
   // buffer, both reach the coercion block with a dead backing store and must be
   // refused with a coded R_BAD_SOURCE (not a raw DataView TypeError).
@@ -248,8 +263,11 @@ export async function run() {
   //   x offset {int,1.5,-1} x stride {derived,==maxEnd,<maxEnd}.
   // Every cell asserts the CONTRACT: the constructor throws a coded R_* IFF
   // checkCoherence flags the same input non-null, and never throws an UNCODED
-  // error. This is 6 x 2 x 5 x 5 x 3 x 3 = 2700 cells and it is the door <->
-  // checkCoherence agreement (the two must never disagree on any input).
+  // error. S10 adds a 7th dimension, littleEndian {absent,true,false,"yes",1,0,
+  // null,NaN,-0} (boolean-or-absent accepted; everything else -> R_BAD_SCHEMA),
+  // which checkCoherence now models too (harness.mjs). This is
+  // 6 x 2 x 5 x 5 x 3 x 3 x 9 = 24300 cells and it is the door <-> checkCoherence
+  // agreement (the two must never disagree on any input).
   // BR-08: the `detached` source kind is a dead backing store -- every one of its
   // cells must throw R_BAD_SOURCE and checkCoherence must flag it non-null, so the
   // agreement law holds even though a detached buffer never reaches schema checks.
@@ -291,6 +309,21 @@ export async function run() {
     { label: '==maxEnd', set: true, stride: 8 }, // F64 maxEnd at offset 0
     { label: '<maxEnd', set: true, stride: 4 },
   ];
+  // S10: field.littleEndian {absent, boolean, non-boolean}. "-0" is the
+  // adversarial boundary -- a NUMBER, not a boolean, so it must throw exactly
+  // like the other non-boolean values; a naive `!fe` truthiness check would
+  // wrongly treat it like `false` (absent-equivalent) and let it through.
+  const M_FIELD_LE = [
+    { label: 'absent', set: false, value: undefined },
+    { label: 'true', set: true, value: true },
+    { label: 'false', set: true, value: false },
+    { label: '"yes"', set: true, value: 'yes' },
+    { label: '1', set: true, value: 1 },
+    { label: '0', set: true, value: 0 },
+    { label: 'null', set: true, value: null },
+    { label: 'NaN', set: true, value: NaN },
+    { label: '-0', set: true, value: -0 },
+  ];
   // Six SOURCE kinds. Each `make()` returns a FRESH source so no cell can be
   // perturbed by a prior construction. A view's checkCoherence/constructor length
   // is source.byteLength; an ArrayBuffer's is its own byteLength.
@@ -320,26 +353,30 @@ export async function run() {
         for (const ty of M_TYPES) {
           for (const of of M_OFFSETS) {
             for (const st of M_STRIDES) {
-              const opts = { schema: [{ name: 'x', type: ty.type, offset: of.offset }], byteOffset: bo.byteOffset };
-              if (c.set) opts.count = c.count;
-              if (st.set) opts.stride = st.stride;
-              // The SAME source object goes to both, so their length resolutions
-              // are compared honestly (BR-07).
-              const src = sk.make();
-              const coh = checkCoherence(src, opts);
-              let threw = null;
-              try { new LiteBinaryReader(src, opts); } catch (e) { threw = e; }
-              const cell = () => 't2 door matrix [source=' + sk.label + ' count=' + c.label +
-                ' byteOffset=' + bo.label + ' type=' + ty.label + ' offset=' + of.label +
-                ' stride=' + st.label + ']';
-              // agreement: the door throws IFF checkCoherence flags the input.
-              check((coh === null) === (threw === null),
-                () => cell() + ': checkCoherence=' + (coh === null ? 'null' : JSON.stringify(coh)) +
-                  ' but constructor ' + (threw === null ? 'did not throw' : 'threw ' + threw.code));
-              // every door throw is a coded R_*, never a raw error.
-              if (threw !== null) {
-                check(typeof threw.code === 'string' && threw.code.indexOf('R_') === 0,
-                  () => cell() + ': threw an uncoded error (' + (threw && threw.name) + ')');
+              for (const fle of M_FIELD_LE) {
+                const field = { name: 'x', type: ty.type, offset: of.offset };
+                if (fle.set) field.littleEndian = fle.value;
+                const opts = { schema: [field], byteOffset: bo.byteOffset };
+                if (c.set) opts.count = c.count;
+                if (st.set) opts.stride = st.stride;
+                // The SAME source object goes to both, so their length resolutions
+                // are compared honestly (BR-07).
+                const src = sk.make();
+                const coh = checkCoherence(src, opts);
+                let threw = null;
+                try { new LiteBinaryReader(src, opts); } catch (e) { threw = e; }
+                const cell = () => 't2 door matrix [source=' + sk.label + ' count=' + c.label +
+                  ' byteOffset=' + bo.label + ' type=' + ty.label + ' offset=' + of.label +
+                  ' stride=' + st.label + ' littleEndian=' + fle.label + ']';
+                // agreement: the door throws IFF checkCoherence flags the input.
+                check((coh === null) === (threw === null),
+                  () => cell() + ': checkCoherence=' + (coh === null ? 'null' : JSON.stringify(coh)) +
+                    ' but constructor ' + (threw === null ? 'did not throw' : 'threw ' + threw.code));
+                // every door throw is a coded R_*, never a raw error.
+                if (threw !== null) {
+                  check(typeof threw.code === 'string' && threw.code.indexOf('R_') === 0,
+                    () => cell() + ': threw an uncoded error (' + (threw && threw.name) + ')');
+                }
               }
             }
           }

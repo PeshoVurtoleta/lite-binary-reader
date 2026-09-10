@@ -31,8 +31,8 @@ function assertCode(fn, code) {
     'expected a LiteBinaryReaderError with code ' + code);
 }
 
-test('VERSION is the shipped v1.1.0 string', () => {
-  assert.equal(VERSION, '1.1.0');
+test('VERSION is the shipped v1.2.0 string', () => {
+  assert.equal(VERSION, '1.2.0');
 });
 
 // --- S4 (v0.3.0): the cursor, readRow, and variable-length surfaces ----------
@@ -1336,4 +1336,121 @@ test('S9: laneOf over a host-endian 64-bit field returns a BigInt view that matc
   // Opposite-endian reader declines the 64-bit lane (never a wrong-endian lane).
   const opp = sixtyFourFixture(!IS_LITTLE_ENDIAN).rd;
   assert.equal(opp.laneOf(0), null, 'opposite-endian 64-bit lane declines to null');
+});
+
+// --- S10 (v1.2.0): per-field endianness --------------------------------------
+// A schema field may carry its OWN `littleEndian`; absent inherits the reader
+// flag. We pin: a mixed-endian record reads each field at its own byte order,
+// bit-exact vs a DataView oracle across every read path and BOTH reader defaults;
+// a field without an override inherits the reader flag (pre-S10 schemas intact);
+// a `false` is honored (not swallowed); laneOf's host-endian gate is per field;
+// and a non-boolean field littleEndian is a coded R_BAD_SCHEMA.
+
+// A 4-field mixed-endian record (stride 24): a BE u32 and a BE i64 interleaved
+// with an LE f32 and an LE u64 -- each value chosen so its LE and BE readings
+// differ (so a byte-order mistake cannot pass unnoticed).
+const MIX = [
+  { name: 'be32', type: T_U32, offset: 0, le: false },
+  { name: 'le32', type: T_F32, offset: 4, le: true },
+  { name: 'bei64', type: T_I64, offset: 8, le: false },
+  { name: 'leu64', type: T_U64, offset: 16, le: true },
+];
+const MIX_STRIDE = 24;
+
+/** Build the mixed-endian fixture. `readerLE` is the reader-level DEFAULT; every
+ *  field carries its own `le`, so the reader default must not change any read. */
+function mixedFixture(readerLE) {
+  const buf = new ArrayBuffer(MIX_STRIDE);
+  const dv = new DataView(buf);
+  dv.setUint32(0, 0x01020304, false);                 // BE
+  dv.setFloat32(4, 3.5, true);                        // LE
+  dv.setBigInt64(8, 0x0102030405060708n, false);      // BE
+  dv.setBigUint64(16, 0x1122334455667788n, true);     // LE
+  const schema = MIX.map((f) => ({ name: f.name, type: f.type, offset: f.offset, littleEndian: f.le }));
+  const rd = new LiteBinaryReader(buf, { schema, stride: MIX_STRIDE, littleEndian: readerLE });
+  return { rd, dv };
+}
+
+test('S10: a mixed-endian record reads each field at its OWN byte order (all paths, both reader defaults)', () => {
+  for (const readerLE of [true, false]) {
+    const { rd, dv } = mixedFixture(readerLE);
+    // oracle: each field read at ITS declared endianness.
+    const oracle = [dv.getUint32(0, false), dv.getFloat32(4, true), dv.getBigInt64(8, false), dv.getBigUint64(16, true)];
+    for (let id = 0; id < MIX.length; id++) {
+      assert.ok(Object.is(rd.get(0, id), oracle[id]), 'get id=' + id + ' readerLE=' + readerLE);
+      assert.ok(Object.is(rd.seek(0).val(id), oracle[id]), 'val id=' + id + ' readerLE=' + readerLE);
+    }
+    // typed getters + cursor reads.
+    assert.equal(rd.getU32(0, 0), oracle[0]); assert.ok(Object.is(rd.getF32(0, 1), oracle[1]));
+    assert.ok(Object.is(rd.getI64(0, 2), oracle[2])); assert.ok(Object.is(rd.getU64(0, 3), oracle[3]));
+    assert.equal(rd.seek(0).u32(0), oracle[0]); assert.ok(Object.is(rd.seek(0).f32(1), oracle[1]));
+    assert.ok(Object.is(rd.seek(0).i64(2), oracle[2])); assert.ok(Object.is(rd.seek(0).u64(3), oracle[3]));
+    // readRow into an Array sink (holds number|bigint).
+    const out = rd.readRow(0, new Array(4));
+    for (let id = 0; id < 4; id++) assert.ok(Object.is(out[id], oracle[id]), 'readRow id=' + id + ' readerLE=' + readerLE);
+    // non-vacuity: the BE field is NOT its LE interpretation, and the reader
+    // default (which flipped across the loop) changed nothing (per-field wins).
+    assert.notEqual(rd.getU32(0, 0), dv.getUint32(0, true), 'be32 is a real BE read, not LE');
+  }
+});
+
+test('S10: a field without littleEndian inherits the reader flag (default-absent regression)', () => {
+  const buf = new ArrayBuffer(8); const dv = new DataView(buf);
+  dv.setUint32(0, 0x0A0B0C0D, true);
+  const schema = [{ name: 'x', type: T_U32, offset: 0 }]; // NO per-field endianness
+  const le = new LiteBinaryReader(buf, { schema, stride: 8, littleEndian: true });
+  const be = new LiteBinaryReader(buf, { schema, stride: 8, littleEndian: false });
+  assert.equal(le.getU32(0, 0), dv.getUint32(0, true), 'LE reader inherits LE');
+  assert.equal(be.getU32(0, 0), dv.getUint32(0, false), 'BE reader inherits BE');
+  assert.notEqual(le.getU32(0, 0), be.getU32(0, 0), 'inheritance actually flips byte order');
+  // explicit `undefined` behaves exactly like absent (not swallowed to a value).
+  const un = new LiteBinaryReader(buf, {
+    schema: [{ name: 'x', type: T_U32, offset: 0, littleEndian: undefined }], stride: 8, littleEndian: false,
+  });
+  assert.equal(un.getU32(0, 0), be.getU32(0, 0), 'explicit undefined inherits like absent');
+});
+
+test('S10: a per-field littleEndian:false is honored, never swallowed', () => {
+  const buf = new ArrayBuffer(4); const dv = new DataView(buf);
+  dv.setUint32(0, 0x01020304, false); // big-endian on the wire
+  // A default-TRUE reader whose field says false must read big-endian (the BR-03
+  // discipline: a legitimate `false` is not treated as "omitted").
+  const rd = new LiteBinaryReader(buf, {
+    schema: [{ name: 'x', type: T_U32, offset: 0, littleEndian: false }], stride: 4, littleEndian: true,
+  });
+  assert.equal(rd.getU32(0, 0), dv.getUint32(0, false), 'false -> BE read');
+  assert.notEqual(rd.getU32(0, 0), dv.getUint32(0, true), 'not the LE interpretation of the same bytes');
+});
+
+test('S10: laneOf is per-field -- a non-host field declines while a host sibling serves', () => {
+  const buf = new ArrayBuffer(16); const dv = new DataView(buf);
+  dv.setUint32(0, 0x11223344, IS_LITTLE_ENDIAN);   // host-endian field @0
+  dv.setUint32(4, 0x55667788, !IS_LITTLE_ENDIAN);  // opposite-endian field @4
+  const rd = new LiteBinaryReader(buf, {
+    schema: [
+      { name: 'host', type: T_U32, offset: 0, littleEndian: IS_LITTLE_ENDIAN },
+      { name: 'opp', type: T_U32, offset: 4, littleEndian: !IS_LITTLE_ENDIAN },
+    ], stride: 8, littleEndian: IS_LITTLE_ENDIAN,
+  });
+  const Lh = rd.laneOf(0), Lo = rd.laneOf(1);
+  assert.notEqual(Lh, null, 'host-endian field is lane-eligible');
+  assert.equal(Lo, null, 'opposite-endian field declines in the SAME reader');
+  assert.equal(Lh.view[Lh.elemOffset], rd.getU32(0, 0), 'served lane matches getX');
+  assert.equal(rd.getU32(0, 1), dv.getUint32(4, !IS_LITTLE_ENDIAN), 'declined field still served by getX');
+});
+
+test('S10: a non-boolean field littleEndian throws R_BAD_SCHEMA; absent/true/false accepted', () => {
+  const buf = new ArrayBuffer(8);
+  // -0 is the sharp one: a NUMBER, so it must throw like the rest (a naive `!fe`
+  // truthiness check would wrongly treat -0 as false and accept it).
+  for (const v of ['yes', 1, 0, null, NaN, -0]) {
+    assertCode(() => new LiteBinaryReader(buf, {
+      schema: [{ name: 'x', type: T_U32, offset: 0, littleEndian: v }], stride: 8,
+    }), 'R_BAD_SCHEMA');
+  }
+  for (const v of [undefined, true, false]) {
+    const s = { name: 'x', type: T_U32, offset: 0 };
+    if (v !== undefined) s.littleEndian = v;
+    new LiteBinaryReader(buf, { schema: [s], stride: 8 }); // must NOT throw
+  }
 });

@@ -2,6 +2,42 @@
 
 All notable changes to `@zakkster/lite-binary-reader`.
 
+## 1.2.0
+
+Per-field endianness (S10). One reader can now read a MIXED-endian record -- e.g. a
+big-endian length/type prefix in front of a little-endian payload -- the next step of
+"endianness is explicit and owned." Additive: any pre-S10 schema (no per-field
+`littleEndian`) reads byte-identically to 1.1.0. No new R_* code and no type-table
+move; the `dts-drift` inventories are unchanged.
+
+### Added
+- An optional `Field.littleEndian?: boolean` on a schema field. Absent inherits the
+  reader-level `littleEndian`; present, it overrides byte order for THAT field only.
+- `Reader.d.ts`: the optional `littleEndian` on the `Field` shape, documented as
+  inheriting the reader flag and declining a `laneOf` lane when it differs from host.
+
+### Changed
+- Every multi-byte read surface (getF64..getU16, getI64/getU64, the cursor reads,
+  and the `get` / `val` / `readRow` arms) reads the field's own endianness from a
+  per-field `_leOf` table. `getI8`/`getU8` and `bytes()` are endianness-agnostic and
+  unchanged. `get littleEndian()` still reports the reader-level flag.
+- `laneOf` eligibility is now PER FIELD: a field whose endianness differs from the
+  host declines to `null` (served by getX) while its host-endian siblings in the same
+  reader still get a lane. An all-default reader's lanes are identical to 1.1.0.
+
+### Notes (the honest boundary)
+- "Byte-identical default" means identical RESULTS plus within-noise performance
+  (measured on `bench/bench.mjs`), NOT a literal source diff: the getter now reads one
+  extra L1 typed-array index (`_leOf[id]`) so it can serve per-field byte order. A
+  single `_leOf` array was chosen over doubling the getter surface (decisions/0011, D1;
+  consistent with S13's rejection of a second getter class).
+- A per-field `false` is honored, never swallowed (the BR-03 discipline). The
+  reader-level `littleEndian` keeps its pre-1.2.0 loose coercion (grandfathered to
+  avoid a breaking change in a minor); the new per-field flag is strictly
+  boolean-or-absent -> `R_BAD_SCHEMA` (decisions/0011).
+- Reader-only feature: no sibling translation. `fromBaked` stays native-endian,
+  `fromLBK1Shard` stays little-endian by spec.
+
 ## 1.1.0
 
 64-bit integer lanes (S9). The one sanctioned move of a frozen 1.0.0 invariant: the

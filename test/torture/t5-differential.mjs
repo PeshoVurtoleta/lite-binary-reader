@@ -93,6 +93,47 @@ export async function run() {
     }
   }
 
+  // --- Oracle E (S10): per-field endianness, cell-for-cell vs a DataView -------
+  // A MIXED-endian record -- each multi-byte field carries its own littleEndian,
+  // alternating host / opposite, with the two 64-bit lanes included. Every read
+  // must equal a DataView read at THAT FIELD'S endianness; a getter that fell back
+  // to a single reader-wide flag would diverge on the opposite-endian fields.
+  {
+    const mixSchema = [
+      { name: 'f64le', type: 1, offset: 0, littleEndian: true },
+      { name: 'f64be', type: 1, offset: 8, littleEndian: false },
+      { name: 'u32le', type: 5, offset: 16, littleEndian: true },
+      { name: 'u32be', type: 5, offset: 20, littleEndian: false },
+      { name: 'i16le', type: 3, offset: 24, littleEndian: true },
+      { name: 'i16be', type: 3, offset: 26, littleEndian: false },
+      { name: 'i64be', type: 8, offset: 28, littleEndian: false },
+      { name: 'u64le', type: 9, offset: 36, littleEndian: true },
+      { name: 'u8', type: 7, offset: 44 }, // endianness-agnostic; inherits reader flag
+    ];
+    const mStride = 48;
+    const mCount = 2048;
+    const mBuf = new ArrayBuffer(mStride * mCount);
+    const mBytes = new Uint8Array(mBuf);
+    for (let i = 0; i < mBytes.length; i++) mBytes[i] = prng() & 0xff; // random raw bytes
+    const mDv = new DataView(mBuf);
+    // The reader default flips BOTH ways across the loop; per-field flags must win.
+    for (const readerLE of [true, false]) {
+      const mr = new LiteBinaryReader(mBuf, { schema: mixSchema, stride: mStride, littleEndian: readerLE });
+      for (let k = 0; k < READS; k++) {
+        const row = prng() % mCount;
+        const fid = prng() % mixSchema.length;
+        const f = mixSchema[fid];
+        const fieldLE = f.littleEndian === undefined ? readerLE : f.littleEndian;
+        const pos = row * mStride + f.offset;
+        const got = typedRead(mr, f.type, row, fid);
+        const oracle = oracleRead(mDv, f.type, pos, fieldLE);
+        check(Object.is(got, oracle),
+          () => 't5 oracle E (per-field le) diverged at k=' + k + ' row=' + row + ' fid=' + fid +
+            ' field=' + f.name + ' readerLE=' + readerLE + ' got=' + got + ' oracle=' + oracle + ' (seed=' + SEED + ')');
+      }
+    }
+  }
+
   // --- Oracle B: an emulated lite-bake buffer (NATIVE endianness) --------------
   // lite-bake writes native order with no marker; fromBaked reads native. Prove
   // every cell equals a direct native DataView read.

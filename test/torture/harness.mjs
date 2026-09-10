@@ -191,6 +191,7 @@ export async function settleGc(cycles) {
  *     Number.isInteger(type[f]) AND 0 <= type[f] < 10                  (BR-02)
  *     Number.isInteger(offset[f]) AND offset[f] >= 0
  *     offset[f] + TYPE_BYTES[type[f]] <= stride                       (BR-02 stride)
+ *     littleEndian[f] === undefined OR typeof littleEndian[f] === 'boolean' (S10)
  *
  * T2 asserts it returns null on every valid input; T9 asserts it returns
  * non-null on hand-fabricated BR-01/BR-02/BR-03 inputs (non-vacuity).
@@ -248,6 +249,12 @@ export function checkCoherence(source, options) {
     }
     if (seen[f.name]) return "duplicate field name '" + f.name + "'";
     seen[f.name] = true;
+    // S10: field.littleEndian must be boolean-or-absent (reuses R_BAD_SCHEMA at
+    // the real door -- no new code, no new field here). Mirrors the constructor's
+    // own check ORDER (after the duplicate-name check) so the two never disagree.
+    if (f.littleEndian !== undefined && typeof f.littleEndian !== 'boolean') {
+      return "field '" + f.name + "' littleEndian must be a boolean, got " + f.littleEndian;
+    }
     const end = o + TYPE_BYTES[t];
     if (end > maxEnd) maxEnd = end;
   }

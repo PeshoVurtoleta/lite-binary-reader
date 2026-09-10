@@ -31,6 +31,12 @@ export declare interface Field {
   type: TypeCode;
   offset: number;
   lengthField?: string | number;
+  /**
+   * S10: this field's byte order. Absent inherits the reader's `littleEndian`
+   * (so any pre-S10 schema is unchanged). A field whose endianness differs from
+   * the host declines a `laneOf()` lane (served by the DataView getX path).
+   */
+  littleEndian?: boolean;
 }
 
 export declare interface Options {

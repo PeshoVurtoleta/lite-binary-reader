@@ -7,7 +7,7 @@ fields with NO allocation, at ANY byte offset, with EXPLICIT endianness. Reads
 through a DataView, so a field may sit at an odd (unaligned) offset a typed-array
 lane cannot address. Single-file ESM, zero runtime dependencies, node:test only.
 
-## Status: 1.1.0 - STABLE (contract frozen at 1.0.0). The R_* code union is exactly
+## Status: 1.2.0 - STABLE (contract frozen at 1.0.0). The R_* code union is exactly
 10 and the full read surface (getX / get / seek+cursor / readRow / laneOf / bytes /
 fromBaked / fromLBK1Shard) is stable -- all gated by the dts-drift test. Breaking any
 of these is a 2.0.0. S9 (1.1.0) landed the ONE sanctioned move of a frozen invariant:
@@ -15,9 +15,13 @@ the type-code table went 8 -> 10, adding the 64-bit integer lanes T_I64=8 / T_U6
 (read as BigInt), in lock-step with the drift gate. A BigInt is a heap value by spec,
 so these two lanes ALLOCATE per read -- the second documented exception alongside
 bytes(); the zero-GC guarantee stays UNQUALIFIED on the 8 primitive-number lanes
-(codes 0-7). Remaining ADDITIVE minors: S10 per-field endianness, S11 .d.ts record
-inference, S12 zero-alloc iterator sugar. decisions/0009 records the 1.0.0 freeze;
-decisions/0010 records the 64-bit lanes and the BigInt-allocation measurement.
+(codes 0-7). S10 (1.2.0) added PER-FIELD endianness: an optional `littleEndian` on a
+schema field, so one reader reads a mixed-endian record (a big-endian prefix in front
+of a little-endian payload); absent inherits the reader flag, so any pre-S10 schema is
+byte-identical. No new R_* code, no type-table move -- the drift inventories are
+unchanged. Remaining ADDITIVE minors: S11 .d.ts record inference, S12 zero-alloc
+iterator sugar. decisions/0009 records the 1.0.0 freeze; decisions/0010 the 64-bit
+lanes; decisions/0011 the per-field endianness decision.
 
 S0 landed the reader and the sibling constructors. S1 hardened the construction
 door (BR-01..BR-04). S2 closed the view-window and sibling-shape holes
@@ -104,12 +108,13 @@ overwrites the window. decisions/0007 records it.
   no DataView call, no branch, zero alloc. An ineligible field returns null and is
   served by getX. laneOf itself is a pure lookup (0 B/op) returning the SAME
   precomputed descriptor each call.
-- ELIGIBILITY (computed cold at construction, per field): the reader is host-endian
-  (littleEndian === IS_LITTLE_ENDIAN) AND the field's first byte is naturally
-  aligned ((base + offset) % width === 0) AND the stride keeps every row aligned
-  (stride % width === 0), width = TYPE_BYTES[type]. A width-1 field (U8/I8) is
-  always eligible on a host-endian reader. An unaligned field, an odd stride, an
-  opposite-endian reader, or an out-of-range id -> null (the decline contract).
+- ELIGIBILITY (computed cold at construction, per field): the FIELD is host-endian
+  (its own littleEndian === IS_LITTLE_ENDIAN; S10 -- so a mixed-endian reader can have
+  some eligible fields and some not) AND the field's first byte is naturally aligned
+  ((base + offset) % width === 0) AND the stride keeps every row aligned
+  (stride % width === 0), width = TYPE_BYTES[type]. A width-1 field (U8/I8) is always
+  eligible on a host-endian field. An unaligned field, an odd stride, an
+  opposite-endian field, or an out-of-range id -> null (the decline contract).
 - A lane read is BYTE-IDENTICAL to getX on every eligible cell (view index maps to
   the same byte address as DataView.getX); this is proven by a t5 differential
   across the alignment x endianness x type matrix, with a t9 stride-mutation control
@@ -179,8 +184,9 @@ carries a coded `R_*` tag on `error.code`:
 ## Read codes (R_*), exactly 10
 
 - R_BAD_SOURCE      source is not an ArrayBuffer/view, or its buffer is detached
-- R_BAD_SCHEMA      schema is not a non-empty array of field descriptors
-- R_BAD_TYPE        a field.type is not an integer in 0..7
+- R_BAD_SCHEMA      schema is not a non-empty array of field descriptors, or a
+                    field's littleEndian (S10) is not a boolean
+- R_BAD_TYPE        a field.type is not an integer in 0..9
 - R_BAD_OFFSET      a field.offset or byteOffset is not a coherent non-negative
                     integer, or byteOffset falls past the end of the buffer
 - R_BAD_STRIDE      stride is not a positive integer, or < the largest field end
@@ -191,11 +197,11 @@ carries a coded `R_*` tag on `error.code`:
                     bytes() span reads past the buffer
 - R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
 
-## API (1.1.0)
+## API (1.2.0)
 
 Named exports from `@zakkster/lite-binary-reader`:
 
-- VERSION: '1.1.0'
+- VERSION: '1.2.0'
 - IS_LITTLE_ENDIAN: boolean (host byte order, detected once)
 - T_F32=0, T_F64=1, T_I32=2, T_I16=3, T_I8=4, T_U32=5, T_U16=6, T_U8=7
 - T_I64=8, T_U64=9 (S9; read as BigInt -- these two lanes allocate, see below)
@@ -207,14 +213,17 @@ Constructor:
 - new LiteBinaryReader(source, { schema, stride?, count?, littleEndian?,
   byteOffset? })
   - source: ArrayBuffer or any ArrayBufferView (TypedArray or DataView).
-  - schema: non-empty Array of { name, type, offset, lengthField? }. name is a
-    string or number; type is a T_* code (0..9); offset is a non-negative integer;
-    optional lengthField (S4) names a sibling field carrying this field's run
-    length, enabling the 2-arg bytes(row, fieldId) overload.
+  - schema: non-empty Array of { name, type, offset, lengthField?, littleEndian? }.
+    name is a string or number; type is a T_* code (0..9); offset is a non-negative
+    integer; optional lengthField (S4) names a sibling field carrying this field's run
+    length, enabling the 2-arg bytes(row, fieldId) overload; optional littleEndian
+    (S10) sets THIS field's byte order (boolean; absent inherits the reader flag).
   - stride: bytes per record; defaults to the tightly-packed minimum (the
     largest field end).
   - count: record count; defaults to floor((byteLength - byteOffset) / stride).
-  - littleEndian: read byte order; default true (the sane wire default).
+  - littleEndian: reader byte order; default true (the sane wire default). A field's
+    own littleEndian (S10) overrides it for that field, so one reader reads a
+    mixed-endian record; a non-boolean field littleEndian is R_BAD_SCHEMA.
   - byteOffset: where the record region starts inside the buffer; default 0.
 
 Introspection (cold):
@@ -270,9 +279,11 @@ Typed-lane fast path (S4b; zero-alloc; opt-in raw typed-array read for the hot l
   like field(). The caller runs `view[row*elemStride + elemOffset]` -- a raw typed
   read, no DataView call, no branch. laneOf is a pure lookup: 0 B/op, same
   descriptor reference each call.
-- Eligible iff (littleEndian === IS_LITTLE_ENDIAN) && ((base+offset) % width === 0)
-  && (stride % width === 0), width = TYPE_BYTES[type]. Width-1 (U8/I8) always
-  eligible on a host-endian reader. Unaligned / odd-stride / opposite-endian /
+- Eligible iff (the FIELD's littleEndian === IS_LITTLE_ENDIAN) && ((base+offset) %
+  width === 0) && (stride % width === 0), width = TYPE_BYTES[type]. S10: the endianness
+  test is PER FIELD, so a mixed-endian reader can serve a lane on its host-endian
+  fields and decline (null) on its opposite-endian ones. Width-1 (U8/I8) always
+  eligible on a host-endian field. Unaligned / odd-stride / opposite-endian /
   out-of-range -> null (the decline contract). A lane read is byte-identical to
   getX on every eligible cell; laneOf declines rather than lies. NO new R_*/type code.
 - S9: a T_I64/T_U64 lane view is a BigInt64Array/BigUint64Array. Obtaining the view

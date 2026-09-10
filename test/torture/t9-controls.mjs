@@ -13,7 +13,7 @@
  * `npm run torture` already proves the gate bites.
  */
 
-import { LiteBinaryReader, IS_LITTLE_ENDIAN, T_F64, T_U8 } from '../../Reader.js';
+import { LiteBinaryReader, IS_LITTLE_ENDIAN, T_F64, T_U8, T_U32 } from '../../Reader.js';
 import { createLeakTracker } from '@zakkster/lite-leak';
 import {
   runOpsGate, runAllocsGate, checkCoherence, oracleRead, censusOk,
@@ -71,6 +71,26 @@ export function run() {
   const droppedLe = oracleRead(leDv, 1, 0, true); // the bug: read LE, ignoring _le=false
   if (Object.is(droppedLe, oracleBe)) {
     die('t9 control 3: a dropped-_le read did not diverge from the BE oracle (no teeth) -- value is endian-symmetric');
+  }
+
+  // --- Control 3b (S10): the per-field-drop control. A DEFAULT-LE reader with a
+  // field marked littleEndian:false must read that field big-endian. The correct
+  // getU32 matches the BE oracle (non-vacuity); a getter that fell back to the
+  // reader-level flag (_le=true) instead of _leOf[id] would read LE and diverge
+  // from the BE oracle (teeth) -- exactly the bug this feature must not have. -----
+  const pfBuf = new ArrayBuffer(4);
+  const pfDv = new DataView(pfBuf);
+  pfDv.setUint32(0, 0x01020304, false); // stored big-endian, an asymmetric value
+  const pfReader = new LiteBinaryReader(pfBuf, {
+    schema: [{ name: 'x', type: T_U32, offset: 0, littleEndian: false }], littleEndian: true, // reader default LE
+  });
+  const pfOracleBe = oracleRead(pfDv, 5, 0, false);
+  if (pfReader.getU32(0, 0) !== pfOracleBe) {
+    die('t9 control 3b: a correct per-field-BE getU32 did not match the BE oracle (vacuous/broken)');
+  }
+  const pfDropped = oracleRead(pfDv, 5, 0, true); // the bug: read with the reader _le=true, ignoring _leOf
+  if (pfDropped === pfOracleBe) {
+    die('t9 control 3b: a per-field-drop read did not diverge from the BE oracle (no teeth) -- value is endian-symmetric');
   }
 
   // --- Control 4: the no-translate LBK1 control (the D3 collision). An LBK1 U32

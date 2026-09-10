@@ -259,4 +259,40 @@ export async function run() {
   check(bigintGrowth > primGrowth,
     () => 'T6 Gate 5: getI64 heap growth ' + bigintGrowth + ' B did not exceed the primitive path ' +
       primGrowth + ' B -- the BigInt allocation is not being observed');
+
+  // --- Gate 6 (S10): the per-field-endianness read path is still 0 B/op --------
+  // The per-field getters read `_leOf[id]` (a Uint8Array index) instead of a single
+  // `_le` flag. That index allocates nothing, but a MIXED-endian reader -- where
+  // some fields are OPPOSITE the host -- exercises the byte-swapping DataView path
+  // on the primitive lanes. Gate it exactly like Gate 1: an interleaved BE/LE
+  // schema over the same buffer must read at 0 B/op through both channels.
+  const mixSchema = [
+    { name: 'f64', type: 1, offset: 0, littleEndian: false },  // BE
+    { name: 'f32', type: 0, offset: 8, littleEndian: true },   // LE
+    { name: 'i32', type: 2, offset: 12, littleEndian: false }, // BE
+    { name: 'u32', type: 5, offset: 16, littleEndian: true },  // LE
+    { name: 'i16', type: 3, offset: 20, littleEndian: false }, // BE
+    { name: 'u16', type: 6, offset: 22, littleEndian: true },  // LE
+    { name: 'i8', type: 4, offset: 24 },                       // agnostic
+    { name: 'u8', type: 7, offset: 25 },                       // agnostic
+  ];
+  const mixReader = new LiteBinaryReader(buf, { schema: mixSchema, stride: STRIDE });
+  const mixHot = (i) => {
+    const idx = i & MASK;
+    sink[0] += mixReader.getF64(idx, 0) + mixReader.getF32(idx, 1) + mixReader.getI32(idx, 2) +
+      mixReader.getU32(idx, 3) + mixReader.getI16(idx, 4) + mixReader.getU16(idx, 5) +
+      mixReader.getI8(idx, 6) + mixReader.getU8(idx, 7) + mixReader.get(idx, 0);
+    if (BREAK) leak.push(new Float64Array(64));
+  };
+  const g6 = runOpsGate(mixHot, { ops: OPS, warmup: WARMUP });
+  if (!g6.report.ok && !BREAK) {
+    die('T6 Gate 6 (mixed-endian) ops gate rejected -- verdict=' + g6.report.verdict +
+      ' (seed-independent; the per-field read path must be 0 B/op)');
+  }
+  const g6a = runAllocsGate(mixHot, { iterations: 50000, batches: 8 });
+  if (!g6a.ok && !BREAK) {
+    die('T6 Gate 6 (mixed-endian) retained-alloc gate rejected -- verdict=' + g6a.report.verdict +
+      ' bytesPerCall=' + g6a.bytesPerCall +
+      ' violations=' + g6a.report.violations.length);
+  }
 }

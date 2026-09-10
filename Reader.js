@@ -77,7 +77,7 @@
  *   R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
  */
 
-export const VERSION = "1.1.0";
+export const VERSION = "1.2.0";
 
 // --- type codes -- byte-for-byte lite-bake's `Types` table (D3) --------------
 export const T_F32 = 0;
@@ -148,12 +148,16 @@ export class LiteBinaryReader {
     /**
      * @param {ArrayBuffer|ArrayBufferView} source  the raw bytes.
      * @param {{
-     *   schema: Array<{name:string, type:number, offset:number, lengthField?:string|number}>,
+     *   schema: Array<{name:string, type:number, offset:number, lengthField?:string|number, littleEndian?:boolean}>,
      *   stride?: number,          // bytes per record; derived from schema if omitted
      *   count?: number,           // record count; derived from buffer size if omitted
-     *   littleEndian?: boolean,   // read byte order (default true -- the sane wire default)
+     *   littleEndian?: boolean,   // reader byte order (default true); a field's own
+     *                             // littleEndian (S10) overrides it for that field
      *   byteOffset?: number       // where the record region starts inside the buffer
      * }} options
+     * A per-field `littleEndian` (S10) lets one reader read mixed-endian records; a
+     * field without it inherits the reader flag, so any pre-S10 schema is unchanged.
+     * A field whose endianness != host declines a laneOf() lane (served by getX).
      */
     constructor(source, options) {
         const opts = options || fail("R_BAD_SCHEMA", "options with a schema are required");
@@ -204,9 +208,15 @@ export class LiteBinaryReader {
         }
         const n = fields.length;
         const off = new Int32Array(n);   // byte offset of each field within a record
-        const type = new Uint8Array(n);  // type code (0..7) of each field
+        const type = new Uint8Array(n);  // type code (0..9) of each field
+        const leOf = new Uint8Array(n);  // S10: per-field endianness (1=LE, 0=BE)
         const name = new Map();          // name -> field id (setup-time resolution only)
         let maxEnd = 0;                  // largest (offset + width) -> the minimum stride
+        // S10: the reader-level endianness (host-order default), computed here so a
+        // field WITHOUT its own `littleEndian` inherits it. Same BR-03 discipline as
+        // byteOffset: an explicit `=== undefined` check, never `|| / ??`, so a
+        // legitimate `false` (a big-endian field) is never swallowed as "omitted".
+        const readerLE = opts.littleEndian === undefined ? true : !!opts.littleEndian;
         for (let i = 0; i < n; i++) {
             const f = fields[i];
             if (!f || typeof f !== "object") fail("R_BAD_SCHEMA", "field " + i + " is not an object");
@@ -215,8 +225,13 @@ export class LiteBinaryReader {
             const o = f.offset;
             if (!Number.isInteger(o) || o < 0) fail("R_BAD_OFFSET", "field '" + f.name + "' has a bad offset " + o);
             if (name.has(f.name)) fail("R_DUPLICATE_FIELD", "duplicate field name '" + f.name + "'");
+            // S10: optional per-field endianness. Boolean-or-absent only (reuse
+            // R_BAD_SCHEMA, no new code); absent inherits the reader flag.
+            const fe = f.littleEndian;
+            if (fe !== undefined && typeof fe !== "boolean") fail("R_BAD_SCHEMA", "field '" + f.name + "' littleEndian must be a boolean, got " + fe);
             off[i] = o;
             type[i] = t;
+            leOf[i] = (fe === undefined ? readerLE : fe) ? 1 : 0;
             name.set(f.name, i);
             const end = o + TYPE_BYTES[t];
             if (end > maxEnd) maxEnd = end;
@@ -275,33 +290,38 @@ export class LiteBinaryReader {
         this._buffer = buffer;
         this._off = off;
         this._type = type;
+        this._leOf = leOf;   // S10: per-field endianness table (read on the hot path)
         this._name = name;
         this._fieldCount = n;
         this._stride = stride;
         this._count = count;
         this._base = base;
-        this._le = opts.littleEndian === undefined ? true : !!opts.littleEndian;
+        this._le = readerLE;  // reader-level default (introspection; the per-field
+                              // fallback already folded into _leOf at the door)
         this._cursor = 0;    // D4 row cursor: moved only by seek(); a Smi by contract
         this._lenOf = lenOf; // per-field lengthField id, or -1 (variable-length wiring)
 
         // --- typed-lane fast path (T3, COLD): a per-field lane descriptor for --
         // every lane-ELIGIBLE field, precomputed once here so laneOf(id) is a
         // pure lookup (zero work, zero alloc on the call -- all allocation at the
-        // door). A field is eligible iff the reader reads HOST byte order AND both
+        // door). A field is eligible iff THAT FIELD reads HOST byte order AND both
         // the field's first byte and the stride are naturally aligned to the type
-        // width: `_le === IS_LITTLE_ENDIAN && (_base + off) % width === 0 &&
+        // width: `_leOf[i] === IS_LITTLE_ENDIAN && (_base + off) % width === 0 &&
         // _stride % width === 0` -- so EVERY row's cell (not just row 0) stays
-        // aligned for a raw typed-array read. At most ONE view per PRESENT
-        // eligible type is built over `buffer` and shared by all its fields.
+        // aligned for a raw typed-array read. S10: the host-endian test is PER FIELD,
+        // so a big-endian field in an otherwise host-endian reader declines to null
+        // while its host-endian siblings still get a lane. At most ONE view per
+        // PRESENT eligible type is built over `buffer` and shared by all its fields.
         // Each descriptor is Object.freeze'd ONCE here, never per call. An
         // ineligible field (wrong endianness, unaligned field, unaligned stride)
         // gets `null` and is served by getX exactly as before: eligibility is an
         // OPTIMIZATION probe, never a gate on reads. NO new R_* code -- declining
         // is a normal answer, not an error.
         const lanes = new Array(n).fill(null);
-        if (this._le === IS_LITTLE_ENDIAN) {
+        {
             const views = [null, null, null, null, null, null, null, null, null, null];
             for (let i = 0; i < n; i++) {
+                if (leOf[i] !== (IS_LITTLE_ENDIAN ? 1 : 0)) continue; // S10: per-field host-endian gate
                 const t = this._type[i];
                 const width = TYPE_BYTES[t];
                 const first = this._base + this._off[i];
@@ -369,26 +389,29 @@ export class LiteBinaryReader {
     // One method per type keeps each call site monomorphic and branch-free
     // (Learning/V8.md): reader.getF32(i, x) never pays a type switch.
 
-    getF64(row, fieldId) { return this._dv.getFloat64(this._base + row * this._stride + this._off[fieldId], this._le); }
-    getF32(row, fieldId) { return this._dv.getFloat32(this._base + row * this._stride + this._off[fieldId], this._le); }
-    getI32(row, fieldId) { return this._dv.getInt32(this._base + row * this._stride + this._off[fieldId], this._le); }
-    getU32(row, fieldId) { return this._dv.getUint32(this._base + row * this._stride + this._off[fieldId], this._le); }
-    getI16(row, fieldId) { return this._dv.getInt16(this._base + row * this._stride + this._off[fieldId], this._le); }
-    getU16(row, fieldId) { return this._dv.getUint16(this._base + row * this._stride + this._off[fieldId], this._le); }
+    // S10: each multi-byte getter reads the field's OWN endianness from `_leOf`
+    // (one L1 typed-array index; default schemas fold to the reader flag at the
+    // door). getI8/getU8 are single-byte -- endianness cannot apply.
+    getF64(row, fieldId) { return this._dv.getFloat64(this._base + row * this._stride + this._off[fieldId], this._leOf[fieldId]); }
+    getF32(row, fieldId) { return this._dv.getFloat32(this._base + row * this._stride + this._off[fieldId], this._leOf[fieldId]); }
+    getI32(row, fieldId) { return this._dv.getInt32(this._base + row * this._stride + this._off[fieldId], this._leOf[fieldId]); }
+    getU32(row, fieldId) { return this._dv.getUint32(this._base + row * this._stride + this._off[fieldId], this._leOf[fieldId]); }
+    getI16(row, fieldId) { return this._dv.getInt16(this._base + row * this._stride + this._off[fieldId], this._leOf[fieldId]); }
+    getU16(row, fieldId) { return this._dv.getUint16(this._base + row * this._stride + this._off[fieldId], this._leOf[fieldId]); }
     getI8(row, fieldId) { return this._dv.getInt8(this._base + row * this._stride + this._off[fieldId]); }
     getU8(row, fieldId) { return this._dv.getUint8(this._base + row * this._stride + this._off[fieldId]); }
 
     // 64-bit lanes (S9). These return a BigInt and therefore ALLOCATE (a BigInt is
     // a heap value by spec) -- they are NOT on the zero-GC read path, by design.
-    getI64(row, fieldId) { return this._dv.getBigInt64(this._base + row * this._stride + this._off[fieldId], this._le); }
-    getU64(row, fieldId) { return this._dv.getBigUint64(this._base + row * this._stride + this._off[fieldId], this._le); }
+    getI64(row, fieldId) { return this._dv.getBigInt64(this._base + row * this._stride + this._off[fieldId], this._leOf[fieldId]); }
+    getU64(row, fieldId) { return this._dv.getBigUint64(this._base + row * this._stride + this._off[fieldId], this._leOf[fieldId]); }
 
     /** Generic read: dispatches on the field's stored type code. One branch per
      *  read -- use the typed getX above in a tight monomorphic loop; use this
      *  when the type is data-driven (mixed schema walk, debug, tooling). */
     get(row, fieldId) {
         const pos = this._base + row * this._stride + this._off[fieldId];
-        const dv = this._dv, le = this._le;
+        const dv = this._dv, le = this._leOf[fieldId];   // S10: this field's endianness
         switch (this._type[fieldId]) {
             case T_F64: return dv.getFloat64(pos, le);
             case T_F32: return dv.getFloat32(pos, le);
@@ -431,22 +454,22 @@ export class LiteBinaryReader {
     /** Point the cursor at `row` (unchecked, chainable). `r.seek(i).f64(id)`. */
     seek(row) { this._cursor = row; return this; }
 
-    f64(id) { return this._dv.getFloat64(this._base + this._cursor * this._stride + this._off[id], this._le); }
-    f32(id) { return this._dv.getFloat32(this._base + this._cursor * this._stride + this._off[id], this._le); }
-    i32(id) { return this._dv.getInt32(this._base + this._cursor * this._stride + this._off[id], this._le); }
-    u32(id) { return this._dv.getUint32(this._base + this._cursor * this._stride + this._off[id], this._le); }
-    i16(id) { return this._dv.getInt16(this._base + this._cursor * this._stride + this._off[id], this._le); }
-    u16(id) { return this._dv.getUint16(this._base + this._cursor * this._stride + this._off[id], this._le); }
+    f64(id) { return this._dv.getFloat64(this._base + this._cursor * this._stride + this._off[id], this._leOf[id]); }
+    f32(id) { return this._dv.getFloat32(this._base + this._cursor * this._stride + this._off[id], this._leOf[id]); }
+    i32(id) { return this._dv.getInt32(this._base + this._cursor * this._stride + this._off[id], this._leOf[id]); }
+    u32(id) { return this._dv.getUint32(this._base + this._cursor * this._stride + this._off[id], this._leOf[id]); }
+    i16(id) { return this._dv.getInt16(this._base + this._cursor * this._stride + this._off[id], this._leOf[id]); }
+    u16(id) { return this._dv.getUint16(this._base + this._cursor * this._stride + this._off[id], this._leOf[id]); }
     i8(id) { return this._dv.getInt8(this._base + this._cursor * this._stride + this._off[id]); }
     u8(id) { return this._dv.getUint8(this._base + this._cursor * this._stride + this._off[id]); }
     // 64-bit cursor reads (S9). Return a BigInt -> allocate, NOT on the zero-GC path.
-    i64(id) { return this._dv.getBigInt64(this._base + this._cursor * this._stride + this._off[id], this._le); }
-    u64(id) { return this._dv.getBigUint64(this._base + this._cursor * this._stride + this._off[id], this._le); }
+    i64(id) { return this._dv.getBigInt64(this._base + this._cursor * this._stride + this._off[id], this._leOf[id]); }
+    u64(id) { return this._dv.getBigUint64(this._base + this._cursor * this._stride + this._off[id], this._leOf[id]); }
 
     /** Generic cursor read: the `get` switch over `_cursor`. */
     val(id) {
         const pos = this._base + this._cursor * this._stride + this._off[id];
-        const dv = this._dv, le = this._le;
+        const dv = this._dv, le = this._leOf[id];   // S10: this field's endianness
         switch (this._type[id]) {
             case T_F64: return dv.getFloat64(pos, le);
             case T_F32: return dv.getFloat32(pos, le);
@@ -476,9 +499,9 @@ export class LiteBinaryReader {
         if (out == null || typeof out.length !== "number" || out.length < this._fieldCount) {
             fail("R_BAD_LENGTH", "readRow out must be indexable with a length >= fieldCount " + this._fieldCount);
         }
-        const pos = this._base + row * this._stride, dv = this._dv, le = this._le, n = this._fieldCount;
+        const pos = this._base + row * this._stride, dv = this._dv, leOf = this._leOf, n = this._fieldCount;
         for (let i = 0; i < n; i++) {
-            const p = pos + this._off[i];
+            const p = pos + this._off[i], le = leOf[i];   // S10: this field's endianness
             switch (this._type[i]) {
                 case T_F64: out[i] = dv.getFloat64(p, le); break;
                 case T_F32: out[i] = dv.getFloat32(p, le); break;
