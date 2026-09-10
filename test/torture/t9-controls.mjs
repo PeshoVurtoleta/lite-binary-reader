@@ -333,4 +333,61 @@ export function run() {
   if (c14Unaligned.laneOf(0) !== null) die('t9 control 14: an unaligned (offset 1) width-2 field was offered a lane (decline contract broken)');
   // out-of-range id declines (bounds-safe null, no throw, no new R_* code).
   if (c14.laneOf(99) !== null) die('t9 control 14: an out-of-range field id did not yield null');
+
+  // --- Control 15 (S12): the row-iterator gate has teeth. A GENERATOR-based
+  // sweep mints a FRESH IteratorResult object on every yield (a language
+  // guarantee, not a maybe) -- exactly the per-row retention the hand-written
+  // `_rowIter` was built to avoid. runAllocsGate MUST reject it. This is the
+  // control that proves Gate 7 (t6-alloc) can fail; a gate that cannot fail is
+  // decorative.
+  //
+  // Retention methodology, discovered empirically: the retained-alloc channel
+  // prices NET heap growth per batch (before/after a forced collection). A
+  // hot body that OVERWRITES a fixed-size slot every call (the Gate 7 / t6
+  // style) reaches a CHURN steady state -- old object collected, new object of
+  // the same size takes its place -- and reads ~0 net growth even though real
+  // allocation is happening on every call; that would make this control
+  // falsely pass. So, exactly like Control 2's retainSink, the hot body must
+  // ACCUMULATE (push, never overwrite) so live population grows linearly with
+  // calls and the per-call byte cost becomes measurable: the generator arm
+  // pushes a genuinely NEW {value,done} object every call (real growth, ~40
+  // B/call measured); the non-vacuous hand-written arm pushes the SAME reused
+  // result reference every call (only amortized array-backing growth, well
+  // under budget). The generator is an infinite cyclical sweep (never
+  // re-created mid-window) so re-arming never contributes a confounding
+  // allocation of its own -- the only thing priced is the per-yield cost. ----
+  const c15Schema = [{ name: 'x', type: T_F64, offset: 0 }];
+  const c15Rows = 4096;
+  const c15Buf = new ArrayBuffer(8 * c15Rows);
+  const c15Dv = new DataView(c15Buf);
+  for (let i = 0; i < c15Rows; i++) c15Dv.setFloat64(i * 8, i * 0.5, true);
+  const c15Reader = new LiteBinaryReader(c15Buf, { schema: c15Schema, stride: 8 });
+  const c15Sink = new Array(1);
+
+  function* genSweep(reader, n, out) {
+    let i = 0;
+    for (;;) { yield reader.readRow(i % n, out); i++; } // fresh IteratorResult per yield
+  }
+  const c15Gen = genSweep(c15Reader, c15Rows, c15Sink);
+  const c15GenRetain = [];
+  const c15GenHot = () => { c15GenRetain.push(c15Gen.next()); };
+  const c15 = runAllocsGate(c15GenHot, { iterations: 50000, batches: 8 });
+  if (c15.ok) {
+    die('t9 control 15: a generator-based row sweep passed the retained-alloc gate ' +
+      '(bytesPerCall=' + c15.bytesPerCall + ') -- the per-yield IteratorResult allocation was not observed');
+  }
+  c15GenRetain.length = 0;
+
+  // non-vacuity: the hand-written `_rowIter` (via rows()), same accumulation
+  // shape, PASSES -- it re-yields the SAME record, so N pushed references
+  // retain only ONE object (plus ordinary array-backing growth).
+  const c15It = c15Reader.rows(c15Sink);
+  const c15HandRetain = [];
+  const c15HandHot = () => { c15HandRetain.push(c15It.next()); };
+  const c15Hand = runAllocsGate(c15HandHot, { iterations: 50000, batches: 8 });
+  if (!c15Hand.ok) {
+    die('t9 control 15: the hand-written row iterator failed the retained-alloc gate (vacuous control) -- verdict=' +
+      c15Hand.report.verdict + ' settled=' + c15Hand.result.settled + ' bytesPerCall=' + c15Hand.bytesPerCall);
+  }
+  c15HandRetain.length = 0;
 }

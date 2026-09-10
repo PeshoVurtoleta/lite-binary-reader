@@ -151,6 +151,17 @@ export declare class LiteBinaryReader<S extends readonly Field[] = readonly Fiel
   val(fieldId: number): number | bigint;
   readRow(row: number, out: RowTuple<S>): RowTuple<S>;
   readRow<T extends RowSink>(row: number, out: T): T;
+  /**
+   * S12: a zero-alloc-PER-ROW sequential sweep. `rows(sink)` fills a caller-owned
+   * sink and yields it each row; bare `[Symbol.iterator]` yields a reader-owned
+   * sink. The SAME object is yielded every row -- BORROWED, copy what you keep
+   * (`[...reader]` gives N references to the one reused array by design; use
+   * `Array.from(reader, r => r.slice())` to materialize). The typed overload
+   * threads the S11 `RowTuple<S>`; the permissive overload keeps a plain sink.
+   */
+  rows(out: RowTuple<S>): IterableIterator<RowTuple<S>>;
+  rows<T extends RowSink>(out: T): IterableIterator<T>;
+  [Symbol.iterator](): IterableIterator<RowTuple<S>>;
   bytes(row: number, fieldId: number): Uint8Array;
   bytes(row: number, fieldId: number, len: number): Uint8Array;
   static fromBaked(baked: Baked, options?: Options): LiteBinaryReader;

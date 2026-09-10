@@ -52,6 +52,17 @@ const sink: RowTuple<typeof schema> = [0, 0n];
 const rowOut = r.readRow(0, sink);
 expectTrue<Equal<typeof rowOut, [number, bigint]>>();
 
+// ---- S12 iterator: threads the SAME RowTuple inference ----------------------
+// rows(sink) with a RowTuple sink resolves the typed overload -> IterableIterator
+// of the schema-derived tuple, not the bare `number | bigint` union.
+const itTyped = r.rows(sink);
+expectTrue<Equal<typeof itTyped, IterableIterator<[number, bigint]>>>();
+// bare `for (const row of reader)` yields the inferred tuple per row.
+for (const row of r) {
+  expectTrue<Equal<typeof row, [number, bigint]>>();
+  break;
+}
+
 // ---- legacy path: a plain `Field[]` schema keeps the pre-S11 behavior -------
 const loose: Field[] = [{ name: "a", type: T_U32, offset: 0 }];
 const rl = new LiteBinaryReader(buf, { schema: loose });
@@ -69,3 +80,8 @@ expectTrue<Equal<typeof faOut, typeof fa>>();
 const arr: (number | bigint)[] = [];
 const arrOut = rl.readRow(0, arr);
 expectTrue<Equal<typeof arrOut, (number | bigint)[]>>();
+
+// S12 legacy: the permissive rows overload returns the caller's own sink type,
+// mirroring readRow -- a Float64Array sink yields IterableIterator<Float64Array>.
+const itLoose = rl.rows(fa);
+expectTrue<Equal<typeof itLoose, IterableIterator<typeof fa>>>();

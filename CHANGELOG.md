@@ -2,6 +2,35 @@
 
 All notable changes to `@zakkster/lite-binary-reader`.
 
+## 1.4.0
+
+Zero-allocation `for...of` row iterator (S12) -- `readRow` as a sequential sweep. The
+whole read surface is now covered: random access (`getX`), sequential cursor (`seek`),
+row fill (`readRow`), the typed-array lane (`laneOf`), and now iteration. No new `R_*`
+code, no type-table move; the eight primitive lanes stay `0 B/op`.
+
+### Added
+- `rows(out)` -- a zero-allocation-per-row sweep into a caller-owned sink:
+  `for (const row of reader.rows(sink)) ...`. Fills and yields `sink` each row.
+- `[Symbol.iterator]()` -- a bare `for (const row of reader)` over a reader-owned sink,
+  same per-row guarantee. Two concurrent sweeps get independent cursors (the bare form
+  allocates a fresh owned sink per call).
+- Typed (S11): with a `const` schema the iterator value is `RowTuple<S>`; a plain
+  `Field[]` schema keeps the permissive sink. `Reader.d.ts` gains the `rows` overloads
+  and `[Symbol.iterator]`; the type-test asserts the yielded tuple.
+
+### Notes
+- The iterator is HAND-WRITTEN, not a generator: a generator allocates a fresh
+  `{ value, done }` per `yield`, which the torture gate rejects. This reuses one result
+  record and one sink -- a new torture Gate 7 holds the sweep at `0 B/op` per row, with a
+  t9 control proving a generator variant FAILS that gate (teeth).
+- The yielded row is BORROWED and reused every step: `[...reader]` returns N references
+  to the one reused array by design -- materialize with `Array.from(reader, r => r.slice())`.
+  A `null`/short sink into `rows` hits the same `R_BAD_LENGTH` door as `readRow`.
+- Runtime read bodies (`getX` / `get` / cursor / `readRow` / `laneOf` / `bytes`) are
+  byte-identical to 1.3.0; the `dts-drift` inventories are unchanged (a new check pins the
+  iterator surface).
+
 ## 1.3.0
 
 Type-level record inference (S11) -- pure DX, ZERO runtime change. A `const`-typed

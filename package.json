@@ -1,7 +1,7 @@
 {
   "name": "@zakkster/lite-binary-reader",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Tiny, zero-dependency, zero-GC reader for raw or foreign binary buffers: point it at an ArrayBuffer + an offsets/type table and read fields with no allocation, any byte offset, explicit endianness.",
   "type": "module",
   "main": "./Reader.js",

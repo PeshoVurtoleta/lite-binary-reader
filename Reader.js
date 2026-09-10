@@ -77,7 +77,7 @@
  *   R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
  */
 
-export const VERSION = "1.3.0";
+export const VERSION = "1.4.0";
 
 // --- type codes -- byte-for-byte lite-bake's `Types` table (D3) --------------
 export const T_F32 = 0;
@@ -517,6 +517,52 @@ export class LiteBinaryReader {
         }
         return out;
     }
+
+    // --- the row iterator (S12, zero-alloc PER ROW) ---------------------------
+    // A sequential sweep as `for...of`. The hard part is the zero-GC contract: a
+    // GENERATOR allocates a FRESH { value, done } IteratorResult on EVERY yield --
+    // a per-row heap allocation the torture gate rejects. So this is a HAND-WRITTEN
+    // iterator that mutates and RE-YIELDS one result record; readRow fills the sink.
+    // Per ROW (per next()): 0 alloc. Per SWEEP: one iterator object + (bare form)
+    // one owned sink, both COLD, amortized over `count` rows -- resolved once like
+    // field() / laneOf(). The SAME sink (and the SAME result object) is handed back
+    // every step: BORROWED, copy what you keep (`r.slice()` / `[...r]` to retain a
+    // row; `Array.from(reader, r => r.slice())` to materialize the whole sweep --
+    // a bare `[...reader]` yields N references to the one reused array, by design).
+
+    /** Build a fresh iterator over `out` (caller-owned). Underscore: cold, internal
+     *  to rows() / [Symbol.iterator], OUT of the public member inventory. Each call
+     *  gets its OWN row counter and result record, so two concurrent sweeps never
+     *  share progress. */
+    _rowIter(out) {
+        const self = this, n = this._count;
+        let row = 0;
+        const result = { value: out, done: false }; // ONE record, reused every step
+        const it = {
+            next() {
+                if (row >= n) { result.value = undefined; result.done = true; return result; }
+                self.readRow(row, out);   // fills the reused sink; 0 alloc (R_BAD_LENGTH door)
+                result.value = out;       // re-point the SAME record; never re-created
+                row++;
+                return result;
+            },
+            [Symbol.iterator]() { return it; } // the iterator is itself iterable
+        };
+        return it;
+    }
+
+    /** Zero-alloc-per-row sweep into a CALLER-owned sink:
+     *  `for (const r of reader.rows(sink)) use(r)`. `sink` is an Array/TypedArray
+     *  sized >= fieldCount (the same R_BAD_LENGTH door as readRow, per row). The
+     *  SAME `sink` is yielded every row -- copy what you keep. This is the explicit
+     *  / typed (S11 RowTuple) path; bare `for...of` uses a reader-owned sink. */
+    rows(out) { return this._rowIter(out); }
+
+    /** Ergonomic bare sweep: `for (const r of reader)`. Yields a READER-owned Array
+     *  (sized fieldCount, built cold here) -- the SAME array every row, BORROWED;
+     *  copy what you keep. A fresh sink per call, so two concurrent bare sweeps do
+     *  not clobber each other. For an explicit or typed sink use rows(out). */
+    [Symbol.iterator]() { return this._rowIter(new Array(this._fieldCount)); }
 
     /** Resolve the run length for a variable-length field at `row` via its
      *  lengthField sibling. Underscore-prefixed: cold, internal to the 2-arg

@@ -295,4 +295,66 @@ export async function run() {
       ' bytesPerCall=' + g6a.bytesPerCall +
       ' violations=' + g6a.report.violations.length);
   }
+
+  // --- Gate 7 (S12): the row iterator -- 0 B/op PER next() ---------------------
+  // The hand-written iterator (NOT a generator: a generator mints a fresh
+  // IteratorResult per yield, which is exactly the allocation this gate would
+  // catch) re-yields ONE result record and fills a caller-owned sink via readRow.
+  // Per-row cost -- one it.next() call -- must be 0 B/op through both channels.
+  // COUNT_IT is sized so ONE long-lived iterator survives the whole ops window
+  // (warmup+ops calls) without exhausting; the alloc window (warmup+batches*iters)
+  // is far larger and WILL exhaust mid-window -- the post-exhaust done path is
+  // itself 0-alloc, so that is not a problem for the gate, only re-armed before
+  // each window starts so every window begins at row 0.
+  const COUNT_IT = 1 << 16; // 65536; strictly more than (WARMUP+OPS) = 62000
+  const bufIt = new ArrayBuffer(STRIDE * COUNT_IT);
+  const dvIt = new DataView(bufIt);
+  for (let r = 0; r < COUNT_IT; r++) {
+    const b = r * STRIDE;
+    dvIt.setFloat64(b + 0, r * 1.5 - 3.25, true);
+    dvIt.setFloat32(b + 8, (r & 255) + 0.5, true);
+    dvIt.setInt32(b + 12, r - 2048, true);
+    dvIt.setUint32(b + 16, (r * 7 + 1) >>> 0, true);
+    dvIt.setInt16(b + 20, (r & 0xffff) - 32768, true);
+    dvIt.setUint16(b + 22, (r * 3) & 0xffff, true);
+    dvIt.setInt8(b + 24, (r & 0xff) - 128);
+    dvIt.setUint8(b + 25, r & 0xff);
+  }
+  const reader7 = new LiteBinaryReader(bufIt, { schema: SCHEMA, stride: STRIDE });
+
+  const itSink = new Array(8); // ONE caller-owned sink, resolved outside the hot closure
+  let it = reader7.rows(itSink); // ONE iterator, resolved outside the hot closure
+
+  const iterBufBytesBefore = reader7.buffer.byteLength;
+  const iterDvBefore = reader7._dv;
+
+  // The hot body: one next() per call, touching a value so the read cannot be
+  // dead-code-eliminated. `it` is re-armed (never re-created inside the body).
+  const iterHot = () => {
+    const r = it.next();
+    if (!r.done) sink[0] += r.value[0];
+  };
+
+  const g7 = runOpsGate(iterHot, { ops: OPS, warmup: WARMUP });
+  check(itSink.length === 8, () => 'T6 Gate 7: the iterator sink grew to length ' + itSink.length);
+  check(reader7.buffer.byteLength === iterBufBytesBefore,
+    () => 'T6 Gate 7: buffer.byteLength changed ' + iterBufBytesBefore + ' -> ' + reader7.buffer.byteLength);
+  check(reader7._dv === iterDvBefore, () => 'T6 Gate 7: the DataView (_dv) was reallocated across the iterator window');
+  if (!g7.report.ok) {
+    const g = g7.summary.gc;
+    die('T6 Gate 7 (row iterator) ops gate rejected -- verdict=' + g7.report.verdict +
+      ' source=' + g7.summary.source + ' major=' + g.major + ' maxMs=' + g.maxMs.toFixed(3));
+  }
+
+  // Re-arm between windows: the alloc window below runs warmup(=iterations) +
+  // batches*iterations next() calls, far more than COUNT_IT, and WILL exhaust
+  // partway through -- by design (the post-exhaust done path is also 0-alloc).
+  it = reader7.rows(itSink);
+  const g7a = runAllocsGate(iterHot, { iterations: 50000, batches: 8 });
+  check(itSink.length === 8, () => 'T6 Gate 7: the iterator sink grew to length ' + itSink.length + ' during the alloc window');
+  if (!g7a.ok) {
+    die('T6 Gate 7 (row iterator) retained-alloc gate rejected -- verdict=' + g7a.report.verdict +
+      ' settled=' + g7a.result.settled + ' bytesPerCall=' + g7a.bytesPerCall +
+      ' violations=' + g7a.report.violations.length);
+  }
 }

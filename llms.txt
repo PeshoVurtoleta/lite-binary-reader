@@ -7,7 +7,7 @@ fields with NO allocation, at ANY byte offset, with EXPLICIT endianness. Reads
 through a DataView, so a field may sit at an odd (unaligned) offset a typed-array
 lane cannot address. Single-file ESM, zero runtime dependencies, node:test only.
 
-## Status: 1.3.0 - STABLE (contract frozen at 1.0.0). The R_* code union is exactly
+## Status: 1.4.0 - STABLE (contract frozen at 1.0.0). The R_* code union is exactly
 10 and the full read surface (getX / get / seek+cursor / readRow / laneOf / bytes /
 fromBaked / fromLBK1Shard) is stable -- all gated by the dts-drift test. Breaking any
 of these is a 2.0.0. S9 (1.1.0) landed the ONE sanctioned move of a frozen invariant:
@@ -25,7 +25,14 @@ infers per-field names (name-safe field(name)) and read types (readRow yields a
 per-field RowTuple<S>, not the bare number|bigint) with ZERO runtime change -- Reader.js
 is byte-identical and a plain Field[] schema keeps the pre-S11 unions; a tsc --noEmit
 type-test (npm run test:types, in verify) gates the inference AND the legacy path.
-Remaining ADDITIVE minor: S12 zero-alloc iterator sugar. decisions/0009 records the
+S12 (1.4.0) adds a ZERO-ALLOCATION `for...of` row iterator: `rows(sink)` sweeps into a
+caller-owned sink and a bare `for (const row of reader)` sweeps into a reader-owned one,
+both 0 B/op per row. It is a HAND-WRITTEN iterator, not a generator (a generator
+allocates a fresh IteratorResult per yield -- the trap); the yielded row is BORROWED and
+reused every step (`[...reader]` gives N refs to one array by design). A new torture Gate
+7 holds the sweep at 0 B/op with a t9 generator control for teeth; no new R_* code, no
+type-table move. With this the read surface is COMPLETE (random access, cursor, readRow,
+laneOf, iterator) and the additive-minor track is closed. decisions/0009 records the
 1.0.0 freeze; decisions/0010 the 64-bit lanes; decisions/0011 the per-field endianness
 decision.
 
@@ -203,11 +210,11 @@ carries a coded `R_*` tag on `error.code`:
                     bytes() span reads past the buffer
 - R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
 
-## API (1.3.0)
+## API (1.4.0)
 
 Named exports from `@zakkster/lite-binary-reader`:
 
-- VERSION: '1.3.0'
+- VERSION: '1.4.0'
 - IS_LITTLE_ENDIAN: boolean (host byte order, detected once)
 - T_F32=0, T_F64=1, T_I32=2, T_I16=3, T_I8=4, T_U32=5, T_U16=6, T_U8=7
 - T_I64=8, T_U64=9 (S9; read as BigInt -- these two lanes allocate, see below)
@@ -277,6 +284,24 @@ Row fill (S4; zero-alloc into a caller-owned sink):
   numeric TypedArray) sink cannot hold -- it throws a TypeError. Use an Array sink
   for a mixed 64-bit row, or a BigInt64Array/BigUint64Array sink for an all-64-bit
   row of that signedness.
+
+Row iterator (S12; zero-alloc PER ROW; readRow as a for...of sweep):
+
+- rows(out) -> IterableIterator. Sweeps every row into a CALLER-owned sink `out`
+  (Array/TypedArray sized >= fieldCount), yielding it each row: `for (const row of
+  reader.rows(sink)) use(row)`. Delegates to readRow (same R_BAD_LENGTH door, on the
+  first step). 0 alloc per row.
+- [Symbol.iterator]() -> IterableIterator. Bare `for (const row of reader)` over a
+  READER-owned Array(fieldCount), fresh per call (so two concurrent bare sweeps do
+  not clobber). Same per-row guarantee.
+- HAND-WRITTEN, not a generator: a generator mints a fresh { value, done } per yield
+  (a per-row alloc the torture gate rejects); this reuses ONE result record + ONE
+  sink. Per sweep it costs one iterator object (+ bare form: one owned array), COLD.
+- The yielded row is BORROWED and reused every step -- copy what you keep. `[...reader]`
+  gives N references to the ONE reused array (all read as the last row) by design;
+  materialize with `Array.from(reader, r => r.slice())`.
+- Typed (S11): with a `const` schema the value is RowTuple<S>; a plain Field[] schema
+  keeps the permissive sink. NO new R_* code, NO type-table move.
 
 Typed-lane fast path (S4b; zero-alloc; opt-in raw typed-array read for the hot loop):
 

@@ -216,3 +216,38 @@ test('control: de-generifying the reader fails the S11 surface check (teeth)', (
   const mutated = DTS.replace(/class LiteBinaryReader<[^>]*>/, 'class LiteBinaryReader');
   assert.ok(!isGenericReader(mutated), 'de-generified d.ts still read as generic');
 });
+
+// --- (e) S12 row-iterator surface: rows()/[Symbol.iterator] must stay declared
+// The runtime `_rowIter`/`rows`/`[Symbol.iterator]` block (S12) is a hand-written
+// zero-alloc-per-row iterator; the type-only surface it needs -- the typed
+// `rows(out: RowTuple<S>)` overload, the permissive `rows<T extends RowSink>`
+// fallback, and `[Symbol.iterator](): IterableIterator<RowTuple<S>>` -- must
+// stay declared or a later .d.ts edit silently regresses callers to `any`/never
+// even though the runtime keeps working. Mirrors the S11 check just above:
+// text-only, so it fails fast even in a checkout that never ran tsc.
+
+/** True if the d.ts declares the full S12 iterator surface. */
+function hasIteratorSurface(dtsText) {
+  return /rows\(out: RowTuple<S>\): IterableIterator<RowTuple<S>>/.test(dtsText)
+    && /rows<T extends RowSink>\(out: T\): IterableIterator<T>/.test(dtsText)
+    && /\[Symbol\.iterator\]\(\): IterableIterator<RowTuple<S>>/.test(dtsText);
+}
+
+test('(e) S12 iterator surface: rows(out: RowTuple<S>), the rows<T> fallback, and [Symbol.iterator] are all declared', () => {
+  assert.ok(hasIteratorSurface(DTS), 'Reader.d.ts is missing part of the S12 row-iterator surface');
+  // each piece checked individually too, so a failure names the missing piece.
+  assert.match(DTS, /rows\(out: RowTuple<S>\): IterableIterator<RowTuple<S>>/, 'missing typed rows(RowTuple<S>) overload');
+  assert.match(DTS, /rows<T extends RowSink>\(out: T\): IterableIterator<T>/, 'missing permissive rows<T extends RowSink> overload');
+  assert.match(DTS, /\[Symbol\.iterator\]\(\): IterableIterator<RowTuple<S>>/, 'missing [Symbol.iterator](): IterableIterator<RowTuple<S>>');
+});
+
+test('control: dropping the [Symbol.iterator] declaration fails the S12 surface check (teeth)', () => {
+  const mutated = DTS.replace(/\s*\[Symbol\.iterator\]\(\): IterableIterator<RowTuple<S>>;\n/, '\n');
+  assert.ok(hasIteratorSurface(DTS), 'sanity: unmutated text must have the surface (non-vacuity)');
+  assert.ok(!hasIteratorSurface(mutated), '[Symbol.iterator] removal did not fail the S12 surface check');
+});
+
+test('control: de-generifying the rows<T> fallback fails the S12 surface check (teeth)', () => {
+  const mutated = DTS.replace(/rows<T extends RowSink>\(out: T\): IterableIterator<T>;\n/, '');
+  assert.ok(!hasIteratorSurface(mutated), 'dropping the rows<T extends RowSink> fallback did not fail the S12 surface check');
+});
