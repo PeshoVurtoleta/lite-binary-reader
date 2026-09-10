@@ -2,6 +2,35 @@
 
 All notable changes to `@zakkster/lite-binary-reader`.
 
+## 1.3.0
+
+Type-level record inference (S11) -- pure DX, ZERO runtime change. A `const`-typed
+schema now infers per-field names and read types, so `field(name)` is name-safe and
+`readRow` yields a schema-derived tuple instead of the bare `number | bigint` union.
+Types only: `Reader.js` is byte-identical to 1.2.0 (the VERSION const aside), the read
+hot path is untouched, and a plain `Field[]` schema keeps the pre-S11 unions -- every
+existing call site compiles unchanged.
+
+### Added
+- `Reader.d.ts` is generic over the schema -- `LiteBinaryReader<S extends readonly
+  Field[]>`, inferred from the constructor's `schema`. New exported type helpers
+  `TypeOf<C>` (a type code -> `number` | `bigint`), `NameOf<S>` (the field-name union),
+  and `RowTuple<S>` (the `readRow` sink/return as a per-field tuple).
+- `field(name)` is typed `NameOf<S>`: a name outside a `const` schema is a COMPILE
+  error (the runtime still throws `R_UNKNOWN_FIELD`).
+- A typed `readRow(row, out: RowTuple<S>): RowTuple<S>` overload alongside the
+  permissive `readRow<T>(row, out: T): T` that keeps the `Array` / `TypedArray` sink.
+- `test/types/reader.test-d.ts`, a `tsc --noEmit` type-test (new `npm run test:types`,
+  folded into `npm run verify`) proving BOTH the inference and the backward-compatible
+  legacy path, with `@ts-expect-error` teeth. `typescript` is a devDependency only --
+  the zero-runtime-dependency guarantee is unchanged.
+
+### Notes
+- Runtime is byte-identical: no new `R_*` code, no type-table move; the `dts-drift`
+  inventories are unchanged (a new check pins the generic surface so it cannot silently
+  regress to bare unions). A non-`const` (plain `Field[]`) schema behaves exactly as in
+  1.2.0.
+
 ## 1.2.0
 
 Per-field endianness (S10). One reader can now read a MIXED-endian record -- e.g. a

@@ -186,3 +186,33 @@ test('control: changing the version string makes version parity fail', () => {
   const mutated = PKG.replace(/"version":\s*"[^"]+"/, '"version": "9.9.9"');
   assert.notEqual(jsVersion(JS), pkgVersion(mutated));
 });
+
+// --- (d) S11 generic surface: type-level inference must not silently regress -
+// The tsc type-test (test/types/) proves the inference WORKS; this text check
+// proves the surface it depends on is still DECLARED, so a later .d.ts edit that
+// drops the generics (regressing to bare number|bigint) fails a fast node:test
+// even in a checkout that never ran tsc. Types-only -- no runtime inventory moves.
+
+/** True if the d.ts declares LiteBinaryReader as generic over a schema param S. */
+function isGenericReader(dtsText) {
+  return /class LiteBinaryReader<\s*S\b/.test(dtsText);
+}
+
+test('(d) S11 generic surface: reader is generic + inference helpers present', () => {
+  assert.ok(isGenericReader(DTS), 'LiteBinaryReader must stay generic (class LiteBinaryReader<S ...>)');
+  for (const t of ['TypeOf', 'NameOf', 'RowTuple', 'RowSink']) {
+    assert.match(DTS, new RegExp('export declare type ' + t + '\\b'), 'missing helper type ' + t);
+  }
+  // field() is name-safe (typed by the schema, not a bare string|number).
+  assert.match(DTS, /field\(name: NameOf<S>\)/, 'field() must be typed NameOf<S> (name-safe)');
+  // readRow keeps BOTH overloads: the typed tuple AND the permissive legacy sink.
+  assert.match(DTS, /readRow\(row: number, out: RowTuple<S>\)/, 'missing typed readRow(RowTuple<S>) overload');
+  assert.match(DTS, /readRow<T extends RowSink>\(/, 'missing permissive readRow<T> legacy overload');
+  // the constructor threads the schema type so S is inferred at the call site.
+  assert.match(DTS, /constructor\(source: [^)]*options: Options<S>\)/, 'constructor must take Options<S>');
+});
+
+test('control: de-generifying the reader fails the S11 surface check (teeth)', () => {
+  const mutated = DTS.replace(/class LiteBinaryReader<[^>]*>/, 'class LiteBinaryReader');
+  assert.ok(!isGenericReader(mutated), 'de-generified d.ts still read as generic');
+});

@@ -77,7 +77,7 @@
  *   R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
  */
 
-export const VERSION = "1.2.0";
+export const VERSION = "1.3.0";
 
 // --- type codes -- byte-for-byte lite-bake's `Types` table (D3) --------------
 export const T_F32 = 0;

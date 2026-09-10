@@ -39,8 +39,31 @@ export declare interface Field {
   littleEndian?: boolean;
 }
 
-export declare interface Options {
-  schema: Field[];
+/**
+ * S11: type-level record inference (types only -- the runtime is byte-identical).
+ * A `const`-typed schema (`[...] as const`) lets the reader infer per-field names
+ * and read types; a plain `Field[]` schema keeps the pre-S11 `number | bigint`
+ * unions, so every existing call site compiles unchanged (backward-compatible).
+ *
+ *   TypeOf<C>   -- a type code -> its read type: primitive codes 0..7 -> number,
+ *                  the 64-bit codes 8|9 -> bigint (mirrors the runtime lanes).
+ *   NameOf<S>   -- the union of the schema's field names; a name outside it is a
+ *                  COMPILE error at `field(name)` (the runtime still throws
+ *                  R_UNKNOWN_FIELD -- the type just catches the typo earlier).
+ *   RowTuple<S> -- the `readRow` sink/return as a tuple keyed by field order,
+ *                  each slot typed number|bigint per that field's code.
+ *   RowSink     -- the permissive caller-owned sink (Array or TypedArray) the
+ *                  legacy `readRow` overload accepts.
+ */
+export declare type TypeOf<C extends TypeCode> = C extends 8 | 9 ? bigint : number;
+export declare type NameOf<S extends readonly Field[]> = S[number]["name"];
+export declare type RowSink = { length: number;[index: number]: number | bigint };
+export declare type RowTuple<S extends readonly Field[]> = {
+  -readonly [K in keyof S]: S[K]["type"] extends 8 | 9 ? bigint : number;
+};
+
+export declare interface Options<S extends readonly Field[] = readonly Field[]> {
+  schema: S;
   stride?: number;
   count?: number;
   littleEndian?: boolean;
@@ -92,14 +115,14 @@ export declare class LiteBinaryReaderError extends Error {
   readonly code: ReaderErrorCode;
 }
 
-export declare class LiteBinaryReader {
-  constructor(source: ArrayBuffer | ArrayBufferView, options: Options);
+export declare class LiteBinaryReader<S extends readonly Field[] = readonly Field[]> {
+  constructor(source: ArrayBuffer | ArrayBufferView, options: Options<S>);
   get count(): number;
   get stride(): number;
   get fieldCount(): number;
   get littleEndian(): boolean;
   get buffer(): ArrayBuffer;
-  field(name: string | number): number;
+  field(name: NameOf<S>): number;
   typeOf(fieldId: number): number;
   offsetOf(fieldId: number): number;
   laneOf(fieldId: number): Lane | null;
@@ -126,7 +149,8 @@ export declare class LiteBinaryReader {
   i64(fieldId: number): bigint;
   u64(fieldId: number): bigint;
   val(fieldId: number): number | bigint;
-  readRow(row: number, out: { length: number; [i: number]: number | bigint }): { length: number; [i: number]: number | bigint };
+  readRow(row: number, out: RowTuple<S>): RowTuple<S>;
+  readRow<T extends RowSink>(row: number, out: T): T;
   bytes(row: number, fieldId: number): Uint8Array;
   bytes(row: number, fieldId: number, len: number): Uint8Array;
   static fromBaked(baked: Baked, options?: Options): LiteBinaryReader;

@@ -7,7 +7,7 @@ fields with NO allocation, at ANY byte offset, with EXPLICIT endianness. Reads
 through a DataView, so a field may sit at an odd (unaligned) offset a typed-array
 lane cannot address. Single-file ESM, zero runtime dependencies, node:test only.
 
-## Status: 1.2.0 - STABLE (contract frozen at 1.0.0). The R_* code union is exactly
+## Status: 1.3.0 - STABLE (contract frozen at 1.0.0). The R_* code union is exactly
 10 and the full read surface (getX / get / seek+cursor / readRow / laneOf / bytes /
 fromBaked / fromLBK1Shard) is stable -- all gated by the dts-drift test. Breaking any
 of these is a 2.0.0. S9 (1.1.0) landed the ONE sanctioned move of a frozen invariant:
@@ -19,9 +19,15 @@ bytes(); the zero-GC guarantee stays UNQUALIFIED on the 8 primitive-number lanes
 schema field, so one reader reads a mixed-endian record (a big-endian prefix in front
 of a little-endian payload); absent inherits the reader flag, so any pre-S10 schema is
 byte-identical. No new R_* code, no type-table move -- the drift inventories are
-unchanged. Remaining ADDITIVE minors: S11 .d.ts record inference, S12 zero-alloc
-iterator sugar. decisions/0009 records the 1.0.0 freeze; decisions/0010 the 64-bit
-lanes; decisions/0011 the per-field endianness decision.
+unchanged. S11 (1.3.0) adds TYPE-LEVEL record inference: Reader.d.ts is generic over
+the schema (LiteBinaryReader<S extends readonly Field[]>), so a `const`-typed schema
+infers per-field names (name-safe field(name)) and read types (readRow yields a
+per-field RowTuple<S>, not the bare number|bigint) with ZERO runtime change -- Reader.js
+is byte-identical and a plain Field[] schema keeps the pre-S11 unions; a tsc --noEmit
+type-test (npm run test:types, in verify) gates the inference AND the legacy path.
+Remaining ADDITIVE minor: S12 zero-alloc iterator sugar. decisions/0009 records the
+1.0.0 freeze; decisions/0010 the 64-bit lanes; decisions/0011 the per-field endianness
+decision.
 
 S0 landed the reader and the sibling constructors. S1 hardened the construction
 door (BR-01..BR-04). S2 closed the view-window and sibling-shape holes
@@ -197,11 +203,11 @@ carries a coded `R_*` tag on `error.code`:
                     bytes() span reads past the buffer
 - R_UNKNOWN_FIELD   field(name) was asked for a name not in the schema
 
-## API (1.2.0)
+## API (1.3.0)
 
 Named exports from `@zakkster/lite-binary-reader`:
 
-- VERSION: '1.2.0'
+- VERSION: '1.3.0'
 - IS_LITTLE_ENDIAN: boolean (host byte order, detected once)
 - T_F32=0, T_F64=1, T_I32=2, T_I16=3, T_I8=4, T_U32=5, T_U16=6, T_U8=7
 - T_I64=8, T_U64=9 (S9; read as BigInt -- these two lanes allocate, see below)

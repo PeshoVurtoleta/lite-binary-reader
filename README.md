@@ -343,6 +343,29 @@ r.getF32(0, r.field('val'));  // read little-endian -- same row, same reader
 
 A field without its own `littleEndian` inherits the reader flag, so any pre-S10 schema reads byte-identically. A non-boolean field `littleEndian` throws `R_BAD_SCHEMA`, and a `false` is honored, never swallowed. The change is a per-field byte-order table read on the hot path (one L1 index); the eight primitive lanes stay 0 B/op. `laneOf` follows suit -- a field whose endianness differs from the host declines (`null`) while its host-endian siblings still get a lane. No new error code and no type-table move.
 
+### Typed reads (TypeScript)
+
+The shipped `Reader.d.ts` is generic over the schema (S11) -- pass a `const`-typed schema and the reader infers per-field names and read types, at **zero runtime cost** (types only, `Reader.js` is byte-identical):
+
+```ts
+const schema = [
+  { name: 'px', type: T_F32, offset: 0 },
+  { name: 'id', type: T_U64, offset: 8 },
+] as const;
+
+const r = new LiteBinaryReader(buf, { schema });
+
+r.field('px');                              // ok
+r.field('nope');                            // compile error: not a field name
+const sink: RowTuple<typeof schema> = [0, 0n];
+const row = r.readRow(0, sink);             // typed [number, bigint]
+```
+
+- **`field(name)`** is name-safe: a name outside the schema is a compile error (the runtime still throws `R_UNKNOWN_FIELD`).
+- **`readRow`** yields a schema-derived tuple `RowTuple<S>` -- a per-field `number` / `bigint`, not the bare union -- when you pass a matching sink; an `Array` or `TypedArray` sink keeps the permissive overload.
+- Exported helpers `TypeOf<C>`, `NameOf<S>`, `RowTuple<S>` let you name these types directly.
+- **Backward-compatible:** a plain `Field[]` (non-`const`) schema keeps the pre-S11 `number | bigint` unions, so existing code compiles unchanged. A `tsc --noEmit` type-test (`npm run test:types`) proves both the inference and the legacy path.
+
 ### Error codes
 
 Every failure throws a `LiteBinaryReaderError` whose `.code` is one of exactly ten `R_*` tags. A drift gate holds the union at exactly ten and keeps it in sync with the shipped types.
@@ -539,10 +562,11 @@ npm run demo:scope       # browser: serves the repo; open the printed URL, then:
 **106 deterministic tests, all pass**, plus a torture gate that proves leak-freedom (now including a schema-space fuzzer) and a controls run that proves the door.
 
 ```bash
-npm test                 # 106 node:test cases (contract + boundary + drift guard + cooperation proof + streaming adapter + hardening gates)
+npm test                 # 108 node:test cases (contract + boundary + drift guard + cooperation proof + streaming adapter + hardening gates)
+npm run test:types       # tsc --noEmit type-test: the generic Reader.d.ts inference + the legacy path (typescript is a devDep only)
 npm run torture          # @zakkster/lite-leak + lite-gc-profiler: 0 B/op, prints "ok"
 npm run torture:controls # the door + coherence controls (every gate can fail)
-npm run verify           # test + torture + controls, the publish gate
+npm run verify           # test + test:types + torture + controls, the publish gate
 npm run bench            # reproducible benchmark (see Performance) -- repo-only, needs --expose-gc
 ```
 

@@ -1,143 +1,183 @@
-# S10 -- v1.2.0 -- per-field endianness (mixed-endian wire structs)  [PLAN FOR REVIEW]
+# S11 -- v1.3.0 -- type-level record inference in Reader.d.ts  [IMPLEMENTED -- awaiting /release 1.3.0 + publish]
 
-status: PLAN, plan-only. Nothing implemented until you say "run it". This is a
-MODULE change (Reader.js hot read path + laneOf + door), so it runs the FULL
-pipeline (planner -> coder -> reviewer -> qa) and every read surface is re-proven by
-`node --expose-gc test/torture.mjs`. Additive minor: version 1.1.0 -> 1.2.0 at
-`/release`. No R_* code added, no type-table move (unlike S9) -- the drift gate's
-three inventories (R_* union 10, type table 10, VERSION===package.json) are unchanged
-except the lock-step VERSION bump.
+status: IMPLEMENTED + verified (all recommendations accepted: D1=S11, D2a=real tsc
+type-test, D2b=safe set only -- no branded-id get). Reader.js is BYTE-IDENTICAL
+(untouched this session; the VERSION const bumps at `/release`). This was a `.d.ts` +
+type-test session, NOT the coder -> reviewer -> qa torture loop: the gate is a TYPE-LEVEL
+`tsc --noEmit` compile test + the extended dts-drift assertion, with `torture` run only
+as the "runtime did not move" regression. GATE RESULTS: `npm run verify` green (npm
+test 108/0 -- was 106, +2 dts-drift generic-surface checks; `test:types` tsc exit 0;
+torture prints "ok"; controls "ok"); the type-test has teeth (reverting field() to the
+loose signature makes tsc fail TS2578 unused-@ts-expect-error); pack still 7 files
+(test/types/ is test-only). Additive minor: 1.2.0 -> 1.3.0. No new R_* code, no
+type-table move -- the drift gate's three inventories (R_* union 10, type table 10,
+VERSION===package.json) are unchanged except the lock-step VERSION bump at `/release`.
 
-why_now: it is the next feature by version (ROADMAP S10) AND the next step of the
-reader's core differentiator -- law #4, "endianness is explicit and owned." Today
-`littleEndian` is ONE per-reader flag; real wire structs are mixed (a big-endian
-length/type prefix in front of a little-endian payload, protocol headers, some GPU
-readback). No sibling baker emits mixed-endian, so this is a READER-only capability
--- exactly the "bytes nobody else can address" wedge, taken one step further.
+WHAT LANDED: Reader.d.ts is generic `LiteBinaryReader<S extends readonly Field[] =
+readonly Field[]>` (S inferred from the constructor `schema`); new exported type helpers
+`TypeOf<C>` / `NameOf<S>` / `RowSink` / `RowTuple<S>`; `field(name: NameOf<S>)` (name-safe);
+a typed `readRow(row, RowTuple<S>): RowTuple<S>` overload beside the permissive
+`readRow<T extends RowSink>(row, T): T`; `Options<S>` threads the schema type. Backward-
+compatible: a plain `Field[]` schema keeps the pre-S11 number|bigint unions. Gate:
+`test/types/reader.test-d.ts` + `test/types/tsconfig.json` (NodeNext, strict), `test:types`
+script folded into `verify`; `typescript` ^7.0.2 devDep only (package-lock is gitignored;
+package.json is the tracked source of truth). dts-drift +2 checks pin the generic surface
+(class generic + helpers + field()/readRow signatures) with a de-generify teeth control.
+Docs: CHANGELOG 1.3.0, README "Typed reads (TypeScript)" subsection + test count 106->108
++ test:types line, llms.txt Status S11 paragraph. NOT bumped this session (per plan): the
+four VERSION sites -- Reader.js:80, package.json, llms.txt Status/API/VERSION, and the
+README/llms version strings -- all move together at `/release 1.3.0`.
 
-===============================================================================
-## What exists today (grounded in Reader.js, not assumed)
-===============================================================================
-  - The reader carries ONE endianness: `this._le` (a boolean), set once at the door
-    from `options.littleEndian` (default host order). EVERY read uses it:
-      * getF64..getU8 / getI64 / getU64  -> `this._dv.getX(pos, this._le)`
-      * the cursor reads f64..u8 / i64 / u64 -> same, over `_cursor`
-      * `get` / `val` / `readRow` switch arms -> `dv.getX(pos, le)` with `le = this._le`
-      * `bytes()` is endianness-agnostic (raw span) -- unaffected.
-  - laneOf eligibility has a SINGLE global gate: `if (this._le === IS_LITTLE_ENDIAN)`
-    wraps the whole per-field lane-build loop (Reader.js ~line 302). A non-host reader
-    declines EVERY lane today; per-field must make that decision per field.
-  - The door validates option shape and every field {name,type,offset,lengthField?};
-    there is no per-field endianness field yet.
+--- original plan (for reference) ---
 
-===============================================================================
-## The design (the one real decision is the hot-path shape)
-===============================================================================
-  Add an OPTIONAL `Field.littleEndian?: boolean`. Absent -> inherit the reader flag.
-  Build a per-field endianness table ONCE at the door:
-      `_leOf[i] = field.littleEndian === undefined ? this._le : field.littleEndian`
-  (explicit `undefined` check, NOT `?? / ||` -- the S2/BR-03 lesson: a legitimate
-  `false` must not be swallowed). Store it as a `Uint8Array` of 0/1, alongside `_off`
-  and `_type` (monomorphic, cache-friendly, zero-alloc to read).
-
-  THE HOT-PATH CHANGE (and why it is honest, not a regression):
-    every getter changes `this._le` -> `this._leOf[fieldId]` (cursor: `this._leOf[id]`;
-    readRow/get/val: `this._leOf[i]`). This is ONE extra typed-array index per read.
-    The roadmap's "default-absent path byte-identical to 1.1.0" CANNOT mean a literal
-    source diff here -- a per-field getter that still hard-codes `this._le` cannot read
-    a per-field flag. So the honest contract is:
-      - IDENTICAL RESULTS on any 1.1.0 schema (no field overrides -> `_leOf[i] === _le`
-        for all i -> same bytes), AND
-      - WITHIN-NOISE performance vs the 1.1.0 getter, PROVEN on the existing S13
-        `bench/bench.mjs` (an L1 array index the branch predictor eats; expected noise).
-
-  DECISION D1 (surface it, do not silently pick): single `_leOf` array getter (one
-    extra index, measured within-noise) vs. DUAL getter classes chosen at the door
-    (byte-identical default, but DOUBLES the hot-getter surface).
-    RECOMMEND: single `_leOf` array. S13 already rejected doubling the getter surface
-    for the ~4% split-endianness micro-gain; the same logic applies -- a predicted L1
-    index is not worth a second getter set to maintain. Prove within-noise on bench;
-    if bench somehow shows a real regression, revisit D1 then, with data.
-
-  laneOf: move the global `this._le === IS_LITTLE_ENDIAN` gate INSIDE the per-field
-  loop as `if (leOf[i] === IS_LITTLE_ENDIAN)`. A field whose own endianness != host
-  declines to null (served by getX), exactly as a whole non-host reader does today; a
-  host-endian field in a mixed reader stays lane-eligible. This is a strict
-  generalization -- an all-default reader behaves identically.
+why_now: two consecutive HOT-PATH module changes just shipped back to back (S9 64-bit
+lanes, S10 per-field endianness). S11 is the lower-risk DX counterpart -- pure types,
+zero runtime risk -- and it closes the one competitive gap the S13 bench review named
+against the TS-first readers (typed-struct, restructure): a `const`-typed schema should
+infer TYPED reads (a per-field `number` / `bigint`) instead of the bare `number|bigint`
+union `get`/`readRow` return today. It is also a genuinely DIFFERENT kind of session --
+a types + type-test session, no torture loop -- which is a healthy change of pace and a
+clean, self-contained win before the heavier S12 iterator work.
 
 ===============================================================================
-## Tasks (planner -> coder -> reviewer -> qa)
+## What exists today (grounded in Reader.d.ts, not assumed)
 ===============================================================================
-  T1  Door: accept `Field.littleEndian?`; validate boolean-or-absent -> else
-      R_BAD_SCHEMA (reuse; NO new code). Build `_leOf` (Uint8Array 0/1) with the
-      explicit-undefined default. O(fields), cold, once.
-  T2  Reads: swap `this._le` -> `this._leOf[<id>]` in getF64..getU8, getI64/getU64,
-      the cursor reads, and the get/val/readRow switch arms. `bytes()` unchanged.
-  T3  laneOf: per-field host-endian gate (move the guard inside the loop).
-  T4  Reader.d.ts: `Field.littleEndian?: boolean` on the schema field type; JSDoc the
-      default-inherits + laneOf-declines-non-host contract. No R_* union / type-table
-      change -> dts-drift untouched but MUST still pass.
-  T5  Torture (every claim falsifiable):
-        - t0/t5 fidelity: a MIXED record -- one LE field + one BE field in the same
-          row -- both bit-exact vs a DataView oracle, LE-host and BE-host paths.
-        - t6: the per-field getters stay 0 B/op (typed-array index allocates nothing);
-          the 8 primitive lanes' existing 0-B/op gates stay green; the 64-bit
-          positive-alloc gate (S9 Gate 5) unaffected.
-        - laneOf: BE field in an LE reader -> null; the LE sibling field -> a served
-          lane; an all-default reader's lanes identical to 1.1.0.
-        - t2 door matrix: `littleEndian` of "yes" / 1 / 0 / null / NaN -> R_BAD_SCHEMA
-          (boolean-or-absent only); absent -> inherits.
-        - t9 control: a getter that reads `this._le` instead of `this._leOf[id]` (the
-          per-field-drop bug) -> a BE field reads byte-swapped garbage -> the mixed
-          differential MUST catch it (analogue of the existing dropped-`_le` control).
-  T6  Bench: run `npm run bench`; confirm the default path is within-noise of 1.1.0
-      (this is the "byte-identical default" done-when, discharged with data).
-  T7  decisions/0011-per-field-endianness.md: record D1 (single `_leOf`), the laneOf
-      per-field gate, the explicit-undefined default, the results-identical +
-      within-noise contract. CHANGELOG 1.2.0 Added; llms.txt + README (the schema
-      field, one mixed-endian example, laneOf-declines-non-host note).
+  - `LiteBinaryReader` is declared as a NON-generic class. `field(name)` takes
+    `string|number` and returns `number`; `get(row,id)` / `val(id)` return
+    `number|bigint`; `readRow(row,out)` takes a loosely-typed sink; the per-type
+    getters (getF64..getU8 -> number, getI64/getU64 -> bigint) are already precise.
+  - The `Field` interface carries `{ name, type, offset, lengthField?, littleEndian? }`.
+    `T_F32=0 .. T_U8=7` (number lanes), `T_I64=8 / T_U64=9` (bigint lanes) are const
+    literals -- so the RETURN type of a field is a pure function of its `type` code, but
+    nothing in the .d.ts derives it from a schema literal.
+  - A caller passing a `const`-typed schema gets NO inference: `field('typo')` compiles,
+    `get(0, id)` is `number|bigint` regardless of the field's real type, and `readRow`'s
+    sink is untyped per slot.
+  - The dts-drift gate (`test/dts-drift.test.js`) reads the TEXT of Reader.js / .d.ts /
+    package.json via regex and asserts the R_* union (10), the type table (10), and
+    VERSION agreement. It does NOT type-check -- a generic surface cannot be kept honest
+    by regex alone (see D2).
+
+===============================================================================
+## The design (a backward-compatible generic; the reach is the real decision)
+===============================================================================
+  Make the class generic over the schema literal, with a DEFAULT param so every
+  existing call site compiles unchanged:
+
+      class LiteBinaryReader<S extends readonly Field[] = readonly Field[]>
+
+  Two small type-level helpers do the work:
+    - `TypeOf<C>`  -- maps a `type` code literal to its TS type: `0..7 -> number`,
+      `8|9 -> bigint`. One conditional type; mirrors TYPE_BYTES' number/bigint split.
+    - `NameOf<S>`  -- the union `S[number]['name']`, the set of field names actually in
+      the schema. `field(name: NameOf<S>)` makes a typo a COMPILE error (the runtime
+      still throws R_UNKNOWN_FIELD; the type just catches it one step earlier).
+
+  THE SCOPE DECISION (D2b): the clean, low-risk, high-value wins are the generic class
+  param + `NameOf` name-safety on `field()` + a TYPED `readRow` sink (a tuple keyed by
+  field order, each slot `TypeOf<S[i]['type']>`). The HARDER reach is typing
+  `get(row, id)` per field: `id` is a runtime integer, so precise per-id return typing
+  needs field ids BRANDED with their type (a `FieldId<T>` phantom returned by a typed
+  `field()`), which is a bigger .d.ts surface and the classic way an inference feature
+  becomes unmaintainable. Recommend: ship the safe set now; hold branded-id `get`
+  typing as a STRETCH only if the type-test shows it stays legible. Over-reaching the
+  .d.ts is a rejected design, same discipline as "no doubled getter surface" (S13/D1).
+
+  BACKWARD COMPAT is non-negotiable: every generic signature keeps a fallback overload
+  matching today's surface, so an untyped or non-`as const` schema resolves EXACTLY to
+  the current `number|bigint` unions. This ADDS inference; it never narrows an existing
+  call in a way that could stop compiling.
+
+===============================================================================
+## Tasks (types + a type-test; NO coder/reviewer/qa torture loop)
+===============================================================================
+  T1  Reader.d.ts: `LiteBinaryReader<S extends readonly Field[] = readonly Field[]>`;
+      `TypeOf<C>` (code -> number|bigint); `NameOf<S>` (name union); typed `field()`;
+      typed `readRow` sink (tuple). Keep the non-generic fallback overloads so existing
+      code compiles untouched. (Stretch, D2b: branded `FieldId<T>` + typed `get`/`val`.)
+  T2  The gate (D2a): add `test/types/reader.test-d.ts` type-assertions compiled by
+      `tsc --noEmit`, wired as a `"test:types"` script (adds a `typescript` DEVdep only --
+      zero runtime dep, ships nothing). It asserts BOTH the new inference AND that the
+      legacy untyped path still resolves to the old unions. RECOMMEND this over a
+      text-only drift extension -- a typed surface with no compile test is exactly the
+      d.ts drift the roadmap flags as a recurring finding class.
+  T3  dts-drift: extend `test/dts-drift.test.js` to assert the generic surface is present
+      (class declared generic; the fallback overloads exist) so a later edit cannot
+      silently drop the generics and regress to bare unions.
+  T4  Reader.js: VERSION const only, at `/release` (byte-identical otherwise). Prove the
+      runtime did not move: `npm run torture` prints "ok" unchanged; `npm test` green
+      with the SAME 106 count (the type-test is a separate `test:types` run, not a
+      node:test case).
+  T5  Docs: CHANGELOG 1.3.0 "Added" (typed reads from a `const` schema; backward-compat
+      note); llms.txt + README -- one "typed reads" example with `as const`, and the
+      explicit "untyped schema keeps the old unions" line. ASCII-only; grep new files
+      for stray tool-call tags. No new file enters `files[]` (type-test is test-only).
 
 ===============================================================================
 ## Assertions (the DONE-WHEN, each falsifiable)
 ===============================================================================
-  - A single reader reads an LE field and a BE field in the SAME row, both bit-exact
-    vs a DataView oracle (failing-before is impossible -- the field does not exist yet;
-    so the proof is oracle equality on the mixed fixture, LE+BE host).
-  - laneOf declines the non-host field (null) and serves the host field; an all-default
-    schema's lanes and reads are identical to 1.1.0 (regression pin).
-  - `littleEndian` non-boolean -> R_BAD_SCHEMA; absent -> inherits the reader flag.
-  - t6: 0 B/op on every primitive read surface; 64-bit positive-alloc gate intact.
-  - t9 per-field-drop control fails the run; LBR_TORTURE_BREAK=1 still fails.
-  - bench: default path within-noise of 1.1.0. verify green; torture "ok"; controls ok.
-  - drift gate green (R_* union 10, type table 10, VERSION===package.json at 1.2.0).
+  - With a `const`-typed schema: `field('notAField')` is a COMPILE error; `field('x')`
+    resolves; `readRow` yields a typed tuple (number for 0..7 fields, bigint for i64/u64).
+  - Legacy path intact: an untyped / non-`as const` schema returns today's `number|bigint`
+    unions and every existing call site still compiles (a fallback-overload test proves it).
+  - `tsc --noEmit` over `test/types/` passes (D2a); dts-drift green (R_* 10, type table
+    10, VERSION 1.3.0, generic surface present).
+  - Runtime UNCHANGED: `npm test` 106/0; `node --expose-gc test/torture.mjs` prints "ok";
+    controls ok; `git diff Reader.js` is VERSION-only.
+  - Pack still 7 files (no type-test, no new source file, ships in the tarball).
 
 ===============================================================================
 ## Non-goals / boundaries
 ===============================================================================
-  - No write path, no schema mutation, no per-read bounds checks (unchanged laws).
-  - No NEW R_* code and NO type-table move -- this is a schema-field addition only.
-  - No doubled getter surface unless bench forces it (D1); default to the single array.
-  - Not a demo session -- demos already cover the shipped surface; a mixed-endian demo
-    line is optional and folds into T7 docs, not a new demo/ file.
+  - No runtime change; no new R_* code; no type-table move (drift inventories unchanged
+    but the VERSION bump).
+  - No branded-id `get(row,id)` per-field typing unless the D2b stretch is taken (id is a
+    runtime int; branding is a larger, riskier .d.ts surface).
+  - Not a torture-pipeline session -- types do not allocate, so there is no new tier and
+    no coder/reviewer/qa loop; torture runs only as the "runtime did not move" regression.
+  - `typescript` is a DEVdep for the type-test only -- the zero-runtime-dep law is intact.
 
 ===============================================================================
 ## Decisions for you (recommendation inline)
 ===============================================================================
-  D1 -- hot-path shape: single `_leOf` array getter (RECOMMEND) vs dual getter classes.
-        RECOMMEND single array -- consistent with S13's rejection of doubling; proven
-        within-noise on bench. Say "dual" only if you want a literal byte-identical
-        default at the cost of a second getter set.
-  D2 -- scope: S10 alone (per-field endianness, v1.2.0)? Or would you rather take a
-        lower-risk DX session next -- S11 (v1.3.0, type-level record inference, PURE
-        .d.ts, zero runtime, no torture) or S12 (v1.4.0, zero-alloc for-of iterator,
-        module change, torture-gated)? RECOMMEND S10 -- it is the next real CAPABILITY
-        and the strongest fit for the reader's endianness-owning wedge; S11/S12 are DX
-        polish that can follow in any order.
+  D1 -- WHICH session next: S11 (RECOMMEND) vs S12. S11 is pure types, zero runtime
+        risk, closes the typed-read gap, and is a lighter different-kind session after
+        two back-to-back hot-path releases. S12 (v1.4.0, zero-alloc `for-of` iterator)
+        is higher user value but a TORTURE-GATED module change (the reused-result-object
+        0-B/op trap -- a naive generator FAILS the gate) AND it carries the `string()`
+        boundary decision (does string-decoding move into the reader, or stay with the
+        producer?). Say "S12" to flip; both are additive minors and order-independent.
+  D2 -- S11 gate + reach (only if D1 = S11):
+        D2a -- gate: a real `tsc --noEmit` type-test (RECOMMEND; adds a `typescript`
+               devDep + `test:types` script, no runtime dep) vs a lighter text-only
+               dts-drift extension (weaker -- cannot actually check inference).
+        D2b -- reach: the safe set {generic class, `field()` name-safety, `TypeOf`
+               mapping, typed `readRow` tuple} (RECOMMEND) vs ALSO branding field ids so
+               `get(row,id)` is typed per field (bigger .d.ts surface -- stretch only).
 
 ===============================================================================
 ===============================================================================
 # Shipped log (most recent first) -- context, not active work
 ===============================================================================
+
+## S10 -- v1.2.0 -- per-field endianness (mixed-endian wire structs)  [DONE, published]
+  Optional `Field.littleEndian?` (absent inherits the reader flag) -> one reader reads a
+  BE prefix in front of an LE payload. Built via a per-field `_leOf` Uint8Array(0/1) at
+  the door (explicit `=== undefined` default -- the BR-03 discipline, so a legitimate
+  big-endian `false` is not swallowed); every multi-byte getter / cursor / get / val /
+  readRow reads `_leOf[id]` instead of the single `_le`; the laneOf host-endian gate is
+  PER FIELD (a mixed reader serves its host-endian fields a lane, declines the
+  opposite-endian ones to null). `_le` retained as reader-level introspection only.
+  D1 accepted: single `_leOf` array, NOT dual getter classes -- consistent with S13's
+  rejection of doubling the getter surface; proven WITHIN-NOISE on bench (n=5 A/B: getX
+  1.25 vs 1.22, laneOf identical 0.564, 0 B/op everywhere; an n=3 false alarm I raised
+  was corrected by the n=5 run). No new R_* code, no type-table move -- drift inventories
+  unchanged but the lock-step VERSION bump. Results byte-identical on any pre-S10 schema.
+  Full pipeline (planner -> coder -> reviewer -> qa + torture). Reviewer nit (the
+  reader-level `!!` coercion asymmetry) GRANDFATHERED + documented, not fixed -- tightening
+  it would reject previously-accepted input in a minor. decisions/0011 records it. verify
+  106/0, torture ok, controls ok; `/release 1.2.0` green. Published; catalog card + suite
+  _index synced to 1.2.0 (per-field endianness surface).
 
 ## Demo refresh (post-1.1.0) -- commit bf35c27  [DONE]
   demo/ only, no module change. T1 compound.mjs zero-alloc join (seek + readRow into
